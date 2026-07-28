@@ -1,0 +1,850 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>YOLO検出 + MobileCLIP2識別 デモ</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f1115; color:#eee; margin:0; padding:16px; max-width:100vw; overflow-x:hidden; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { color:#9aa0a6; font-size:13px; margin:0 0 20px; }
+  #status { padding:10px 14px; background:#1a1d24; border-radius:10px; font-size:13px; margin-bottom:16px; display:flex; align-items:center; gap:8px; }
+  .spinner { width:14px;height:14px;border:2px solid #444;border-top-color:#7c9cff;border-radius:50%;animation:spin 0.8s linear infinite; flex-shrink:0; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #progressBarOuter { background:#1a1d24; border-radius:8px; height:6px; overflow:hidden; margin-bottom:16px; }
+  #progressBarInner { background:#7c9cff; height:100%; width:0%; transition:width 0.2s; }
+  #modelError { display:none; background:#3a1a1a; border:1px solid #6a2a2a; border-radius:10px; padding:12px 14px; font-size:13px; color:#ff9a9a; margin-bottom:16px; }
+  #uploadBox { border:1px dashed #3a3d45; border-radius:12px; padding:24px; text-align:center; cursor:pointer; max-width:480px; }
+  #uploadBox:hover { border-color:#7c9cff; }
+  #uploadBox.disabled { opacity:0.5; cursor:not-allowed; }
+  section h2 { font-size:14px; color:#c8ccd4; margin:0 0 10px; }
+  .crop-grid { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .crop-card { text-align:center; width:84px; }
+  .crop-card img { width:76px; height:76px; border-radius:8px; background:#fff; border:1px solid #2a2d35; }
+  .crop-card .idx { font-size:10px; color:#7c9cff; margin-top:2px; }
+  .crop-card .label { font-size:11px; color:#eee; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .crop-card .score { font-size:10px; color:#9aa0a6; }
+  .shiny-badge { color:#facc15; }
+  .group-title { font-size:12px; color:#9aa0a6; margin-bottom:6px; }
+</style>
+</head>
+<body>
+
+<h1>ブラウザ内YOLO検出 + MobileCLIP2識別 デモ</h1>
+<p class="sub">学習済みYOLOモデル(icon_detector.onnx、index.htmlと同じ場所に設置)で画像から最大12体のアイコンを検出・切り抜き、事前計算済みのembeddings.json(MobileCLIP2埋め込みデータベース)と照合してポケモン名を表示します。embeddings.jsonはブラウザ内では生成しません。</p>
+
+<div id="status"><div class="spinner"></div><span id="statusText">モデルを読み込み中...</span></div>
+<div id="progressBarOuter"><div id="progressBarInner"></div></div>
+<div id="modelError"></div>
+
+<section>
+  <h2>カメラで撮影(枠オーバーレイ)</h2>
+  <p style="margin:0 0 10px;font-size:12px;color:#facc15;">📱 スマホは横向き(ランドスケープ)にして撮影してください</p>
+  <div id="cameraStartBox" style="border:1px dashed #3a3d45;border-radius:12px;padding:20px;text-align:center;cursor:pointer;max-width:900px;">
+    <p style="margin:0;font-size:13px;color:#9aa0a6;">クリックしてカメラを起動</p>
+  </div>
+  <div id="cameraWrap" style="display:none;position:relative;width:100%;max-width:900px;aspect-ratio:16/9;margin:0 auto;border-radius:12px;overflow:hidden;background:#000;">
+    <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+  </div>
+  <div id="cameraControls" style="display:none;margin-top:10px;display:flex;gap:8px;">
+    <button id="captureBtn" style="background:#4ade80;color:#0f1115;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:bold;cursor:pointer;">撮影して検出</button>
+    <button id="stopCamBtn" style="background:#2a2d35;color:#eee;border:none;border-radius:8px;padding:10px 16px;font-size:13px;cursor:pointer;">カメラを閉じる</button>
+  </div>
+  <div id="cameraError" style="display:none;font-size:13px;color:#ff9a9a;margin-top:8px;"></div>
+  <div id="cameraResult" style="margin-top:12px;"></div>
+</section>
+
+<section>
+  <h2>自分の画像で12体検出(ファイルアップロード)</h2>
+  <div id="uploadBox" class="disabled">
+    <p style="margin:0;font-size:13px;color:#9aa0a6;" id="uploadHint">モデル読み込み完了までお待ちください...</p>
+    <input type="file" id="fileInput" accept="image/*" style="display:none;">
+  </div>
+  <div id="uploadResult" style="margin-top:12px;"></div>
+</section>
+
+<script type="module">
+import { CLIPVisionModelWithProjection, Tensor, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+// Always fetch MobileCLIP2 (S2) from the Hugging Face hub -- no local model folder,
+// so nothing needs to be manually downloaded onto the device. The browser's
+// own HTTP/Cache Storage still caches it after the first load, so repeat
+// visits don't re-download, but there's no folder to manage.
+env.allowLocalModels = false;
+
+const statusText = document.getElementById('statusText');
+const statusBox = document.getElementById('status');
+const progressBarInner = document.getElementById('progressBarInner');
+const modelError = document.getElementById('modelError');
+const fileInput = document.getElementById('fileInput');
+const uploadBox = document.getElementById('uploadBox');
+const uploadHint = document.getElementById('uploadHint');
+const uploadResult = document.getElementById('uploadResult');
+
+function loadImage(src) {
+  return new Promise((res, rej) => {
+    const img = new Image();
+    img.onload = () => res(img);
+    img.onerror = rej;
+    img.src = src;
+  });
+}
+
+// Resolution of each cropped-out icon image, and the DB reference icons.
+const ICON_SIZE = 128;
+
+function cosine(a, b) {
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot;
+}
+
+// ---- MobileCLIP2 (B) species identification (runs on YOLO's cropped icons) ----
+const MOBILECLIP_SIZE = 'b';
+// Input size per MobileCLIP2 variant (must match compute_embeddings.py's
+// IMAGE_SIZE for whichever MOBILECLIP_SIZE is selected there): S0/S2=256, B/L14=224.
+const MOBILECLIP_IMAGE_SIZE = (MOBILECLIP_SIZE === 'b' || MOBILECLIP_SIZE === 'l14') ? 224 : 256;
+let modelPromise = null;     // resolves to the vision model
+let dbEmbeddings = null; // one entry per icon (normal AND shiny kept separate internally)
+
+// classify: match against every icon (normal+shiny), then collapse to one
+// result per species name (keeping whichever variant scored higher) so
+// shiny and normal versions of the same Pokemon are shown as a single entry.
+function scoreVec(vec) {
+  const scored = dbEmbeddings.map(d => ({ label: d.label, shiny: d.shiny, score: cosine(vec, d.vec) }));
+  scored.sort((a, b) => b.score - a.score);
+
+  const bestByName = new Map();
+  for (const s of scored) {
+    const existing = bestByName.get(s.label);
+    if (!existing || s.score > existing.score) bestByName.set(s.label, s);
+  }
+  return Array.from(bestByName.values()).sort((a, b) => b.score - a.score).slice(0, 6);
+}
+
+// Preprocess a data URL into MobileCLIP2's expected input tensor by hand
+// (resize to MOBILECLIP_IMAGE_SIZE, scale to 0-1) instead of going through
+// AutoProcessor/preprocessor_config.json. AutoProcessor was intermittently
+// resolving to a stale/wrong-size config (e.g. still 256 after switching to
+// the 224px 'b' model), causing an OrtRun dimension-mismatch error. Doing
+// it manually also keeps this in lockstep with compute_embeddings.py's
+// preprocess(), which uses the same mean=0/std=1, resize-then-scale approach.
+function dataUrlToClipTensor(dataUrl) {
+  return loadImage(dataUrl).then(img => {
+    const size = MOBILECLIP_IMAGE_SIZE;
+    const canvas = document.createElement('canvas');
+    canvas.width = size; canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, size, size);
+    const { data } = ctx.getImageData(0, 0, size, size);
+    const plane = size * size;
+    const floatData = new Float32Array(3 * plane);
+    for (let i = 0; i < plane; i++) {
+      floatData[i] = data[i * 4] / 255;               // R
+      floatData[plane + i] = data[i * 4 + 1] / 255;    // G
+      floatData[plane * 2 + i] = data[i * 4 + 2] / 255; // B
+    }
+    return new Tensor('float32', floatData, [1, 3, size, size]);
+  });
+}
+
+async function classify(dataUrl) {
+  const model = await modelPromise;
+  const pixel_values = await dataUrlToClipTensor(dataUrl);
+  const outputs = await model({ pixel_values });
+  // MobileCLIP2's vision model already returns a pooled, single vector per
+  // image (image_embeds) -- unlike the old DINOv3 export, there's no
+  // last_hidden_state/CLS-token extraction needed here. README-documented
+  // output is unnormalized, so L2-normalize before cosine similarity.
+  const normalized = outputs.image_embeds.normalize(2, -1);
+  const vec = Array.from(normalized.data);
+  // Guard against silently-wrong results: if the live query vector's
+  // dimension doesn't match the database's, cosine() would otherwise just
+  // truncate/compare partial vectors and return meaningless scores that
+  // consistently favor one arbitrary label instead of erroring out.
+  if (dbEmbeddings.length && vec.length !== dbEmbeddings[0].vec.length) {
+    throw new Error(`埋め込みの次元数が一致しません(クエリ:${vec.length}次元, DB:${dbEmbeddings[0].vec.length}次元)。embeddings.jsonを生成したモデルと表示中のモデルが違います。`);
+  }
+  return scoreVec(vec);
+}
+
+// NOTE: passing an array of images through the model/processor in one call
+// did not behave as a simple per-image batch under the old DINOv3 pipeline
+// API -- keeping the same one-at-a-time processing here for safety even
+// though MobileCLIP2's vision model can technically accept a batch.
+async function classifyBatch(dataUrls) {
+  const results = [];
+  for (const url of dataUrls) {
+    results.push(await classify(url));
+  }
+  return results;
+}
+
+// ---- automatic local cache (IndexedDB) for the DB embeddings ----
+// There's no bundled embeddings.json here, so the 480 reference icons are
+// embedded once client-side on first load and cached persistently in
+// IndexedDB -- subsequent loads on the same browser/device skip straight
+// to the cached vectors.
+const IDB_DB_NAME = 'pokemon-clip-demo';
+const IDB_STORE = 'kv';
+const EMBEDDINGS_CACHE_KEY = 'dbEmbeddings_v_mobileclip2_s2_512d_128px_yolo_crop';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      req.result.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSet(key, value) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Loads the precomputed embeddings database from embeddings.json, placed
+// alongside index.html (generated offline by a separate script, e.g.
+// compute_embeddings.py). This app never computes embeddings itself --
+// if the file is missing, identification simply isn't available.
+async function tryLoadPrecomputed() {
+  try {
+    const res = await fetch('./embeddings.json');
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// ---- camera live capture ----
+const cameraStartBox = document.getElementById('cameraStartBox');
+const cameraWrap = document.getElementById('cameraWrap');
+const cameraControls = document.getElementById('cameraControls');
+const camVideo = document.getElementById('camVideo');
+const captureBtn = document.getElementById('captureBtn');
+const stopCamBtn = document.getElementById('stopCamBtn');
+const cameraError = document.getElementById('cameraError');
+const cameraResult = document.getElementById('cameraResult');
+let camStream = null;
+
+cameraStartBox.addEventListener('click', async () => {
+  cameraError.style.display = 'none';
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment',
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        aspectRatio: { ideal: 16 / 9 }
+      }
+    });
+    camVideo.srcObject = camStream;
+    cameraStartBox.style.display = 'none';
+    cameraWrap.style.display = 'block';
+    cameraControls.style.display = 'flex';
+  } catch (err) {
+    cameraError.style.display = 'block';
+    cameraError.textContent = 'カメラを起動できませんでした: ' + err.message + '(ブラウザのカメラ許可設定をご確認ください)';
+  }
+});
+
+function stopCamera() {
+  if (camStream) {
+    camStream.getTracks().forEach(t => t.stop());
+    camStream = null;
+  }
+  cameraWrap.style.display = 'none';
+  cameraControls.style.display = 'none';
+  cameraStartBox.style.display = 'block';
+}
+stopCamBtn.addEventListener('click', stopCamera);
+
+// ---- camera color-cast correction ("auto levels" black+white point) ----
+// A camera's auto white balance / ambient lighting shifts colors relative
+// to a color-accurate screenshot. Applied only to camera shots, not uploads
+// that are already digital screenshots.
+function autoWhiteBalance(canvas) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const data = imgData.data;
+
+  const histR = new Uint32Array(256), histG = new Uint32Array(256), histB = new Uint32Array(256);
+  let count = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] === 0) continue;
+    histR[data[i]]++; histG[data[i + 1]]++; histB[data[i + 2]]++;
+    count++;
+  }
+  if (count === 0) return canvas;
+
+  const percentile = (hist, p) => {
+    const target = count * p;
+    let cum = 0;
+    for (let v = 0; v < 256; v++) {
+      cum += hist[v];
+      if (cum >= target) return v;
+    }
+    return 255;
+  };
+
+  const MIN_RANGE = 40;
+  const channels = [
+    { hist: histR, off: 0 },
+    { hist: histG, off: 1 },
+    { hist: histB, off: 2 },
+  ].map(({ hist, off }) => {
+    const black = percentile(hist, 0.01);
+    const white = percentile(hist, 0.99);
+    const scale = 255 / Math.max(white - black, MIN_RANGE);
+    return { off, black, scale };
+  });
+
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] === 0) continue;
+    for (const { off, black, scale } of channels) {
+      const v = (data[i + off] - black) * scale;
+      data[i + off] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+
+// ---- OpenCV.js (optional, used only to refine YOLO box edges) ----
+let cvReadyPromise = null;
+function getCv() {
+  if (!cvReadyPromise) {
+    cvReadyPromise = new Promise((resolve, reject) => {
+      if (window.cv && window.cv.Mat) { resolve(window.cv); return; }
+      const script = document.createElement('script');
+      script.src = 'https://docs.opencv.org/4.9.0/opencv.js';
+      script.async = true;
+      script.onload = () => {
+        if (window.cv && window.cv.Mat) {
+          resolve(window.cv);
+        } else if (window.cv) {
+          window.cv.onRuntimeInitialized = () => resolve(window.cv);
+        } else {
+          reject(new Error('opencv.js loaded but window.cv is missing'));
+        }
+      };
+      script.onerror = () => reject(new Error('opencv.js failed to load'));
+      document.head.appendChild(script);
+    });
+  }
+  return cvReadyPromise;
+}
+
+// ---- onnxruntime-web + trained YOLO icon detector ----
+let ortReadyPromise = null;
+// Multi-threaded wasm tries to reserve a large SharedArrayBuffer up front,
+// which throws "RangeError: Out of memory" / "no available backend found"
+// on memory-constrained mobile browsers -- this page also isn't
+// cross-origin-isolated, which threads require anyway. Forcing
+// single-threaded wasm avoids that large up-front allocation.
+function configureOrt(ort) {
+  ort.env.wasm.numThreads = 1;
+  ort.env.wasm.proxy = false;
+}
+function getOrt() {
+  if (!ortReadyPromise) {
+    ortReadyPromise = new Promise((resolve, reject) => {
+      if (window.ort) { configureOrt(window.ort); resolve(window.ort); return; }
+      const script = document.createElement('script');
+      script.src = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/ort.min.js';
+      script.async = true;
+      script.onload = () => {
+        if (window.ort) { configureOrt(window.ort); resolve(window.ort); }
+        else reject(new Error('onnxruntime-web loaded but window.ort is missing'));
+      };
+      script.onerror = () => reject(new Error('onnxruntime-web failed to load'));
+      document.head.appendChild(script);
+    });
+  }
+  return ortReadyPromise;
+}
+
+let yoloSessionPromise = null;
+function getYoloSession() {
+  if (!yoloSessionPromise) {
+    yoloSessionPromise = (async () => {
+      const ort = await getOrt();
+      return await ort.InferenceSession.create('./icon_detector.onnx', {
+        executionProviders: ['wasm']
+      });
+    })();
+  }
+  return yoloSessionPromise;
+}
+
+const YOLO_INPUT_SIZE = 640;
+const YOLO_CONF_THRESHOLD = 0.4;
+const YOLO_IOU_THRESHOLD = 0.45;
+
+// letterbox: resize preserving aspect ratio onto a fixed square canvas,
+// padding with a neutral gray (114) -- standard YOLO preprocessing, must
+// match how the model was trained.
+function letterboxToCanvas(sourceCanvas, size) {
+  const w = sourceCanvas.width, h = sourceCanvas.height;
+  const scale = Math.min(size / w, size / h);
+  const nw = Math.round(w * scale), nh = Math.round(h * scale);
+  const dx = Math.floor((size - nw) / 2), dy = Math.floor((size - nh) / 2);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgb(114,114,114)';
+  ctx.fillRect(0, 0, size, size);
+  ctx.drawImage(sourceCanvas, 0, 0, w, h, dx, dy, nw, nh);
+  return { canvas, scale, dx, dy };
+}
+
+function canvasToCHWTensor(canvas, ort) {
+  const { width, height } = canvas;
+  const ctx = canvas.getContext('2d');
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const floatData = new Float32Array(3 * width * height);
+  const plane = width * height;
+  for (let i = 0; i < plane; i++) {
+    floatData[i] = data[i * 4] / 255;               // R
+    floatData[plane + i] = data[i * 4 + 1] / 255;    // G
+    floatData[plane * 2 + i] = data[i * 4 + 2] / 255; // B
+  }
+  return new ort.Tensor('float32', floatData, [1, 3, height, width]);
+}
+
+function boxIou(a, b) {
+  const x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]);
+  const x1 = Math.min(a[2], b[2]), y1 = Math.min(a[3], b[3]);
+  const inter = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const areaA = (a[2] - a[0]) * (a[3] - a[1]);
+  const areaB = (b[2] - b[0]) * (b[3] - b[1]);
+  return inter / (areaA + areaB - inter + 1e-6);
+}
+
+function nms(boxes, scores, iouThreshold) {
+  const order = scores.map((s, i) => i).sort((i, j) => scores[j] - scores[i]);
+  const keep = [];
+  const suppressed = new Set();
+  for (const i of order) {
+    if (suppressed.has(i)) continue;
+    keep.push(i);
+    for (const j of order) {
+      if (j === i || suppressed.has(j)) continue;
+      if (boxIou(boxes[i], boxes[j]) > iouThreshold) suppressed.add(j);
+    }
+  }
+  return keep;
+}
+
+// Expands `box` by a generous margin and searches within that window for
+// the best-matching icon-shaped blob, returning a tightened box in
+// sourceCanvas's pixel space -- or null if nothing confident is found, in
+// which case the original YOLO box is kept as-is.
+function refineBoxToIcon(cv, gray, sourceCanvas, box) {
+  const w = box.x1 - box.x0, h = box.y1 - box.y0;
+  const marginX = w * 0.6, marginY = h * 0.6;
+  const rx0 = Math.max(0, Math.round(box.x0 - marginX));
+  const ry0 = Math.max(0, Math.round(box.y0 - marginY));
+  const rx1 = Math.min(sourceCanvas.width, Math.round(box.x1 + marginX));
+  const ry1 = Math.min(sourceCanvas.height, Math.round(box.y1 + marginY));
+  if (rx1 - rx0 < 4 || ry1 - ry0 < 4) return null;
+
+  const roi = gray.roi(new cv.Rect(rx0, ry0, rx1 - rx0, ry1 - ry0));
+  const edges = new cv.Mat();
+  const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  let best = null;
+  try {
+    cv.Canny(roi, edges, 50, 150);
+    cv.dilate(edges, edges, kernel);
+    cv.findContours(edges, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+
+    const targetArea = w * h;
+    const boxCx = (box.x0 + box.x1) / 2 - rx0, boxCy = (box.y0 + box.y1) / 2 - ry0;
+    let bestScore = Infinity;
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const r = cv.boundingRect(cnt);
+      const area = r.width * r.height;
+      const aspect = r.width / r.height;
+      if (aspect > 0.4 && aspect < 2.2 && area > targetArea * 0.4 && area < targetArea * 2.5) {
+        const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        const distScore = Math.hypot(cx - boxCx, cy - boxCy);
+        if (distScore < bestScore) { bestScore = distScore; best = r; }
+      }
+      cnt.delete();
+    }
+  } catch {
+    best = null;
+  } finally {
+    roi.delete(); edges.delete(); kernel.delete();
+    contours.delete(); hierarchy.delete();
+  }
+
+  if (!best) return null;
+  return {
+    x0: rx0 + best.x, y0: ry0 + best.y,
+    x1: rx0 + best.x + best.width, y1: ry0 + best.y + best.height
+  };
+}
+
+// Runs the trained detector on sourceCanvas (any resolution) and returns
+// up to 12 boxes split into own/opp by x-position, sorted top-to-bottom.
+// Returns null if the model isn't confident (too few detections).
+// Diagnostics from the most recent detectIconsYolo() call, so the UI can
+// tell the user *why* detection was rejected (too few boxes vs. an
+// uneven own/opp split) instead of always showing the same generic
+// "couldn't detect 12" message regardless of cause.
+let lastDetectDebug = null;
+
+async function detectIconsYolo(sourceCanvas) {
+  let ort, session;
+  try {
+    ort = await getOrt();
+    session = await getYoloSession();
+  } catch (err) {
+    console.error('[yolo] failed to load model:', err);
+    lastDetectDebug = 'YOLOモデルの読み込みに失敗しました: ' + (err.message || err);
+    return null;
+  }
+
+  const { canvas: lbCanvas, scale, dx, dy } = letterboxToCanvas(sourceCanvas, YOLO_INPUT_SIZE);
+  const tensor = canvasToCHWTensor(lbCanvas, ort);
+
+  let output;
+  try {
+    const results = await session.run({ images: tensor });
+    output = results[session.outputNames[0]];
+  } catch (err) {
+    console.error('[yolo] inference failed:', err);
+    lastDetectDebug = 'YOLO推論に失敗しました: ' + (err.message || err);
+    return null;
+  }
+
+  // output shape [1, 5, 8400] -> [cx, cy, w, h, conf] per anchor
+  const [, numAttrs, numAnchors] = output.dims;
+  const data = output.data;
+
+  const boxesXyxy = [];
+  const scores = [];
+  for (let i = 0; i < numAnchors; i++) {
+    const conf = data[4 * numAnchors + i];
+    if (conf < YOLO_CONF_THRESHOLD) continue;
+    const cx = data[i], cy = data[numAnchors + i];
+    const w = data[2 * numAnchors + i], h = data[3 * numAnchors + i];
+    boxesXyxy.push([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]);
+    scores.push(conf);
+  }
+
+  if (boxesXyxy.length === 0) {
+    lastDetectDebug = `信頼度${YOLO_CONF_THRESHOLD}以上の検出が0件でした(モデルが画像内にアイコンを見つけられていません)。`;
+    return null;
+  }
+
+  const keepIdx = nms(boxesXyxy, scores, YOLO_IOU_THRESHOLD);
+
+  const detections = keepIdx.map(i => {
+    const [x0, y0, x1, y1] = boxesXyxy[i];
+    return {
+      x0: (x0 - dx) / scale, y0: (y0 - dy) / scale,
+      x1: (x1 - dx) / scale, y1: (y1 - dy) / scale,
+      score: scores[i]
+    };
+  });
+
+  console.log(`[yolo] ${detections.length} confident detections (threshold ${YOLO_CONF_THRESHOLD})`, detections.map(d => d.score.toFixed(2)));
+
+  if (detections.length < 8) {
+    console.warn(`[yolo] only ${detections.length} confident detections, treating as unreliable`);
+    lastDetectDebug = `検出数が${detections.length}件(8件未満)でした。画像にアイコン一覧全体が写っているか確認してください。`;
+    return null;
+  }
+
+  // split into own (left) / opp (right) by the biggest x-center gap
+  const withCx = detections.map(d => ({ ...d, cx: (d.x0 + d.x1) / 2, cy: (d.y0 + d.y1) / 2 }));
+  withCx.sort((a, b) => a.cx - b.cx);
+  let splitAt = -1, biggestGap = 0;
+  for (let i = 1; i < withCx.length; i++) {
+    const gap = withCx[i].cx - withCx[i - 1].cx;
+    if (gap > biggestGap) { biggestGap = gap; splitAt = i; }
+  }
+  if (splitAt < 0) {
+    lastDetectDebug = '左右2グループへの分割に失敗しました。';
+    return null;
+  }
+
+  const own = withCx.slice(0, splitAt).sort((a, b) => a.cy - b.cy).slice(0, 6)
+    .map((d, i) => ({ side: '味方', idx: i + 1, x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 }));
+  const opp = withCx.slice(splitAt).sort((a, b) => a.cy - b.cy).slice(0, 6)
+    .map((d, i) => ({ side: '相手', idx: i + 7, x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 }));
+
+  if (own.length < 5 || opp.length < 5) {
+    lastDetectDebug = `検出数が偏っています(左:${own.length}件, 右:${opp.length}件)。各5件以上必要です。`;
+    return null;
+  }
+
+  lastDetectDebug = null;
+
+  // Auto-refine each YOLO box to the actual icon content (optional, best-effort).
+  try {
+    const cv = await getCv();
+    if (cv && cv.Mat) {
+      const src = cv.imread(sourceCanvas);
+      const gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      for (const box of [...own, ...opp]) {
+        const refined = refineBoxToIcon(cv, gray, sourceCanvas, box);
+        if (refined) Object.assign(box, refined);
+      }
+      src.delete(); gray.delete();
+    }
+  } catch (err) {
+    console.warn('[yolo] box refinement skipped:', err);
+  }
+
+  return { own, opp };
+}
+
+// Crop directly from a canvas using box coordinates already expressed in
+// that same canvas's own pixel space.
+function cropBoxToDataUrlRaw(sourceCanvas, box) {
+  const PAD = 0.10;
+  const rawH = box.y1 - box.y0;
+  const padY = rawH * PAD;
+  const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
+  const side = rawH + padY * 2;
+  const x = cx - side / 2, y = cy - side / 2;
+  const out = document.createElement('canvas');
+  out.width = ICON_SIZE; out.height = ICON_SIZE;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, ICON_SIZE, ICON_SIZE);
+  ctx.drawImage(sourceCanvas, x, y, side, side, 0, 0, ICON_SIZE, ICON_SIZE);
+  return out.toDataURL('image/jpeg', 0.9);
+}
+
+// Runs YOLO to find + crop up to 12 icons, then classifies each crop
+// against the MobileCLIP2 species database.
+async function detectAndIdentify(sourceCanvas) {
+  const detected = await detectIconsYolo(sourceCanvas);
+  if (!detected) return null;
+
+  const allBoxes = [...detected.own, ...detected.opp];
+  const cropSrcs = allBoxes.map(box => cropBoxToDataUrlRaw(sourceCanvas, box));
+  const tops = await classifyBatch(cropSrcs);
+
+  const own = [], opp = [];
+  allBoxes.forEach((box, i) => {
+    const entry = { idx: box.idx, cropSrc: cropSrcs[i], top: tops[i] };
+    if (box.side === '味方') own.push(entry); else opp.push(entry);
+  });
+  return { own, opp };
+}
+
+function renderGroupResults(container, groupTitle, entries) {
+  const box = document.createElement('div');
+  const h = document.createElement('div');
+  h.className = 'group-title';
+  h.textContent = groupTitle;
+  box.appendChild(h);
+  const grid = document.createElement('div');
+  grid.className = 'crop-grid';
+  box.appendChild(grid);
+  container.appendChild(box);
+  entries.forEach(e => {
+    const card = document.createElement('div');
+    card.className = 'crop-card';
+    const img = document.createElement('img');
+    img.src = e.cropSrc;
+    const idx = document.createElement('div');
+    idx.className = 'idx';
+    idx.textContent = `#${e.idx}`;
+    const label = document.createElement('div');
+    label.className = 'label';
+    const best = e.top[0];
+    label.textContent = best.label;
+    if (best.shiny) {
+      const badge = document.createElement('span');
+      badge.className = 'shiny-badge';
+      badge.textContent = ' ✨';
+      label.appendChild(badge);
+    }
+    const score = document.createElement('div');
+    score.className = 'score';
+    score.textContent = best.score.toFixed(3);
+    card.appendChild(img);
+    card.appendChild(idx);
+    card.appendChild(label);
+    card.appendChild(score);
+    grid.appendChild(card);
+  });
+}
+
+captureBtn.addEventListener('click', async () => {
+  const canvas = document.createElement('canvas');
+  canvas.width = camVideo.videoWidth;
+  canvas.height = camVideo.videoHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
+
+  cameraResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
+  autoWhiteBalance(canvas);
+
+  let result = null;
+  let errorMsg = null;
+  try {
+    result = await detectAndIdentify(canvas);
+  } catch (err) {
+    console.error(err);
+    errorMsg = (err && err.message) ? err.message : String(err);
+  }
+
+  if (result) {
+    cameraResult.innerHTML = '';
+    renderGroupResults(cameraResult, '味方6体', result.own);
+    renderGroupResults(cameraResult, '相手6体', result.opp);
+  } else if (errorMsg) {
+    cameraResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
+  } else {
+    cameraResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写るように撮り直してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
+  }
+});
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const dataUrl = await new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result);
+    r.onerror = () => rej(new Error('read failed'));
+    r.readAsDataURL(file);
+  });
+  const img = await loadImage(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  canvas.getContext('2d').drawImage(img, 0, 0);
+
+  uploadResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
+
+  let result = null;
+  let errorMsg = null;
+  try {
+    result = await detectAndIdentify(canvas);
+  } catch (err) {
+    console.error(err);
+    errorMsg = (err && err.message) ? err.message : String(err);
+  }
+
+  if (result) {
+    uploadResult.innerHTML = '';
+    renderGroupResults(uploadResult, '味方6体', result.own);
+    renderGroupResults(uploadResult, '相手6体', result.opp);
+  } else if (errorMsg) {
+    uploadResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
+  } else {
+    uploadResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写っている画像で試してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
+  }
+});
+
+uploadBox.addEventListener('click', () => {
+  if (uploadBox.classList.contains('disabled')) return;
+  fileInput.click();
+});
+
+async function init() {
+  try {
+    statusText.textContent = 'YOLOモデルを読み込み中...';
+    await getYoloSession();
+
+    statusText.textContent = 'MobileCLIP2モデルを読み込み中(初回は330MB程度)...';
+    // NOTE: must match whatever model embeddings.json was generated with.
+    // vec length 512 => MobileCLIP2-B's projected image_embeds dimension.
+    // Mixing dimensions silently produces garbage cosine-similarity scores
+    // (every crop collapsing onto the same "best" label) instead of an error.
+    modelPromise = CLIPVisionModelWithProjection.from_pretrained('plhery/mobileclip2-onnx', {
+      device: 'wasm', // matches the single-threaded wasm onnxruntime-web setup used for YOLO
+      dtype: 'fp32',
+      model_file_name: `${MOBILECLIP_SIZE}/vision_model`,
+      progress_callback: (p) => {
+        if (p.status === 'progress') {
+          statusText.textContent = `MobileCLIP2モデル読み込み中... ${p.file || ''} ${Math.round(p.progress || 0)}%`;
+          progressBarInner.style.width = Math.round(p.progress || 0) + '%';
+        } else if (p.status === 'initiate') {
+          statusText.textContent = `MobileCLIP2モデルを探しています... ${p.file || ''}`;
+        }
+      },
+    });
+    await modelPromise;
+    progressBarInner.style.width = '100%';
+
+    // check order: IndexedDB cache (instant, no network) -> bundled
+    // embeddings.json. No in-browser computation fallback -- embeddings.json
+    // (from compute_embeddings.py) is the only source of truth.
+    const cached = await idbGet(EMBEDDINGS_CACHE_KEY);
+    const precomputed = cached || await tryLoadPrecomputed();
+
+    if (!precomputed) {
+      statusBox.querySelector('.spinner').style.display = 'none';
+      document.getElementById('progressBarOuter').style.display = 'none';
+      statusText.textContent = 'embeddings.jsonが見つかりません。compute_embeddings.py(Python)を実行してembeddings.jsonを生成し、index.htmlと同じフォルダに置いてから読み込み直してください。';
+      modelError.style.display = 'block';
+      modelError.textContent = '';
+      uploadHint.textContent = 'embeddings.jsonが必要です。アップロード判定は利用できません。';
+      return;
+    }
+
+    dbEmbeddings = precomputed;
+    statusText.textContent = cached
+      ? `キャッシュ済みの埋め込みを読み込みました(${dbEmbeddings.length}件)`
+      : `embeddings.jsonを読み込みました(${dbEmbeddings.length}件)`;
+    if (!cached) await idbSet(EMBEDDINGS_CACHE_KEY, dbEmbeddings);
+
+    statusBox.style.display = 'none';
+    document.getElementById('progressBarOuter').style.display = 'none';
+    uploadBox.classList.remove('disabled');
+    uploadHint.textContent = 'クリックして画像をアップロード';
+  } catch (err) {
+    statusBox.querySelector('.spinner').style.display = 'none';
+    statusText.textContent = 'モデルの読み込みに失敗しました。';
+    modelError.style.display = 'block';
+    modelError.textContent = 'エラー詳細: ' + err.message;
+    uploadHint.textContent = 'モデルが読み込めなかったため、アップロード判定は利用できません。';
+  }
+}
+
+init();
+</script>
+</body>
+</html>
