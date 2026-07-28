@@ -99,8 +99,8 @@ function cosine(a, b) {
   return dot;
 }
 
-// ---- MobileCLIP2 (B) species identification (runs on YOLO's cropped icons) ----
-const MOBILECLIP_SIZE = 'b';
+// ---- MobileCLIP2 (S2) species identification (runs on YOLO's cropped icons) ----
+const MOBILECLIP_SIZE = 's2';
 // Input size per MobileCLIP2 variant (must match compute_embeddings.py's
 // IMAGE_SIZE for whichever MOBILECLIP_SIZE is selected there): S0/S2=256, B/L14=224.
 const MOBILECLIP_IMAGE_SIZE = (MOBILECLIP_SIZE === 'b' || MOBILECLIP_SIZE === 'l14') ? 224 : 256;
@@ -788,9 +788,9 @@ async function init() {
     statusText.textContent = 'YOLOモデルを読み込み中...';
     await getYoloSession();
 
-    statusText.textContent = 'MobileCLIP2モデルを読み込み中(初回は330MB程度)...';
+    statusText.textContent = 'MobileCLIP2モデルを読み込み中(初回は136MB程度)...';
     // NOTE: must match whatever model embeddings.json was generated with.
-    // vec length 512 => MobileCLIP2-B's projected image_embeds dimension.
+    // vec length 512 => MobileCLIP2-S2's projected image_embeds dimension.
     // Mixing dimensions silently produces garbage cosine-similarity scores
     // (every crop collapsing onto the same "best" label) instead of an error.
     modelPromise = CLIPVisionModelWithProjection.from_pretrained('plhery/mobileclip2-onnx', {
