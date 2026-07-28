@@ -32,7 +32,7 @@
 <body>
 
 <h1>ブラウザ内YOLO検出 + MobileCLIP2識別 デモ</h1>
-<p class="sub">学習済みYOLOモデル(icon_detector.onnx、index.htmlと同じ場所に設置)で画像から最大12体のアイコンを検出・切り抜き、事前計算済みのembeddings.json(MobileCLIP2埋め込みデータベース)と照合してポケモン名を表示します。embeddings.jsonはブラウザ内では生成しません。</p>
+<p class="sub">学習済みYOLOモデル(icon_detector.onnx)とMobileCLIP2識別モデル(mobileclip2_s2_vision_model.onnx)、どちらもindex.htmlと同じ場所に設置して画像から最大12体のアイコンを検出・切り抜き、事前計算済みのembeddings.json(MobileCLIP2埋め込みデータベース)と照合してポケモン名を表示します。3ファイルとも外部サイトから取得せず、同じホスティング上のファイルだけで動作します。</p>
 
 <div id="status"><div class="spinner"></div><span id="statusText">モデルを読み込み中...</span></div>
 <div id="progressBarOuter"><div id="progressBarInner"></div></div>
@@ -65,12 +65,13 @@
 </section>
 
 <script type="module">
-import { CLIPVisionModelWithProjection, Tensor, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-// Always fetch MobileCLIP2 (S2) from the Hugging Face hub -- no local model folder,
-// so nothing needs to be manually downloaded onto the device. The browser's
-// own HTTP/Cache Storage still caches it after the first load, so repeat
-// visits don't re-download, but there's no folder to manage.
-env.allowLocalModels = false;
+// No @huggingface/transformers import needed anymore -- both the YOLO
+// detector and the MobileCLIP2 vision encoder are loaded as plain,
+// self-hosted ONNX files (mobileclip2_s2_vision_model.onnx, placed next to
+// index.html) via onnxruntime-web (see getOrt() below). This removes any
+// dependency on Hugging Face's hub/CDN at runtime -- required for GitHub
+// Pages hosting where every asset must be served from the same repo. The
+// browser's own HTTP cache still avoids re-downloading on repeat visits.
 
 const statusText = document.getElementById('statusText');
 const statusBox = document.getElementById('status');
@@ -104,7 +105,6 @@ const MOBILECLIP_SIZE = 's2';
 // Input size per MobileCLIP2 variant (must match compute_embeddings.py's
 // IMAGE_SIZE for whichever MOBILECLIP_SIZE is selected there): S0/S2=256, B/L14=224.
 const MOBILECLIP_IMAGE_SIZE = (MOBILECLIP_SIZE === 'b' || MOBILECLIP_SIZE === 'l14') ? 224 : 256;
-let modelPromise = null;     // resolves to the vision model
 let dbEmbeddings = null; // one entry per icon (normal AND shiny kept separate internally)
 
 // classify: match against every icon (normal+shiny), then collapse to one
@@ -123,41 +123,40 @@ function scoreVec(vec) {
 }
 
 // Preprocess a data URL into MobileCLIP2's expected input tensor by hand
-// (resize to MOBILECLIP_IMAGE_SIZE, scale to 0-1) instead of going through
-// AutoProcessor/preprocessor_config.json. AutoProcessor was intermittently
-// resolving to a stale/wrong-size config (e.g. still 256 after switching to
-// the 224px 'b' model), causing an OrtRun dimension-mismatch error. Doing
-// it manually also keeps this in lockstep with compute_embeddings.py's
-// preprocess(), which uses the same mean=0/std=1, resize-then-scale approach.
-function dataUrlToClipTensor(dataUrl) {
+// (resize to MOBILECLIP_IMAGE_SIZE, scale to 0-1, no other normalization)
+// -- reuses the same canvasToCHWTensor() helper as the YOLO detector below,
+// since both models take a plain 0-1 scaled RGB CHW tensor. This keeps
+// preprocessing in lockstep with compute_embeddings.py's preprocess(),
+// which uses the identical mean=0/std=1, resize-then-scale approach.
+function dataUrlToClipTensor(dataUrl, ort) {
   return loadImage(dataUrl).then(img => {
     const size = MOBILECLIP_IMAGE_SIZE;
     const canvas = document.createElement('canvas');
     canvas.width = size; canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, size, size);
-    const { data } = ctx.getImageData(0, 0, size, size);
-    const plane = size * size;
-    const floatData = new Float32Array(3 * plane);
-    for (let i = 0; i < plane; i++) {
-      floatData[i] = data[i * 4] / 255;               // R
-      floatData[plane + i] = data[i * 4 + 1] / 255;    // G
-      floatData[plane * 2 + i] = data[i * 4 + 2] / 255; // B
-    }
-    return new Tensor('float32', floatData, [1, 3, size, size]);
+    canvas.getContext('2d').drawImage(img, 0, 0, size, size);
+    return canvasToCHWTensor(canvas, ort);
   });
 }
 
+function l2NormalizeArray(arr) {
+  let sumSq = 0;
+  for (let i = 0; i < arr.length; i++) sumSq += arr[i] * arr[i];
+  const norm = Math.sqrt(sumSq) || 1;
+  const out = new Array(arr.length);
+  for (let i = 0; i < arr.length; i++) out[i] = arr[i] / norm;
+  return out;
+}
+
 async function classify(dataUrl) {
-  const model = await modelPromise;
-  const pixel_values = await dataUrlToClipTensor(dataUrl);
-  const outputs = await model({ pixel_values });
+  const ort = await getOrt();
+  const session = await getClipSession();
+  const pixel_values = await dataUrlToClipTensor(dataUrl, ort);
+  const results = await session.run({ [clipInputName]: pixel_values });
   // MobileCLIP2's vision model already returns a pooled, single vector per
-  // image (image_embeds) -- unlike the old DINOv3 export, there's no
-  // last_hidden_state/CLS-token extraction needed here. README-documented
-  // output is unnormalized, so L2-normalize before cosine similarity.
-  const normalized = outputs.image_embeds.normalize(2, -1);
-  const vec = Array.from(normalized.data);
+  // image (image_embeds) -- there's no last_hidden_state/CLS-token
+  // extraction needed here. The raw ONNX output is unnormalized, so
+  // L2-normalize before cosine similarity (matches compute_embeddings.py).
+  const vec = l2NormalizeArray(Array.from(results[clipOutputName].data));
   // Guard against silently-wrong results: if the live query vector's
   // dimension doesn't match the database's, cosine() would otherwise just
   // truncate/compare partial vectors and return meaningless scores that
@@ -168,10 +167,10 @@ async function classify(dataUrl) {
   return scoreVec(vec);
 }
 
-// NOTE: passing an array of images through the model/processor in one call
-// did not behave as a simple per-image batch under the old DINOv3 pipeline
+// NOTE: passing an array of images through the model in one call did not
+// behave as a simple per-image batch under the old transformers.js pipeline
 // API -- keeping the same one-at-a-time processing here for safety even
-// though MobileCLIP2's vision model can technically accept a batch.
+// though the raw ONNX session can technically accept a batch.
 async function classifyBatch(dataUrls) {
   const results = [];
   for (const url of dataUrls) {
@@ -404,6 +403,56 @@ function getYoloSession() {
     })();
   }
   return yoloSessionPromise;
+}
+
+// Self-hosted MobileCLIP2 (S2) vision encoder. Place the file
+// "mobileclip2_s2_vision_model.onnx" next to index.html (it's the exact
+// same file compute_embeddings.py downloads to
+// ./model_cache/mobileclip2_s2/vision_model.onnx -- just copy it over).
+// Loaded as a plain ONNX Runtime session (no Hugging Face hub/CDN
+// involved), so this works on GitHub Pages or any static host with
+// nothing but these files in the repo.
+const MOBILECLIP_ONNX_PATH = './mobileclip2_s2_vision_model.onnx';
+let clipSessionPromise = null;
+let clipInputName = null;
+let clipOutputName = null;
+
+// Manual fetch-with-progress instead of ort.InferenceSession.create(url),
+// since the latter gives no download-progress signal -- this keeps the
+// existing progress bar working for the ~136MB download.
+async function fetchArrayBufferWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`モデルファイルの取得に失敗しました: ${url} (HTTP ${res.status})。index.htmlと同じ場所に mobileclip2_s2_vision_model.onnx を置き忘れていませんか?`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total && onProgress) onProgress(received / total);
+  }
+  const buf = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { buf.set(chunk, offset); offset += chunk.length; }
+  return buf.buffer;
+}
+
+function getClipSession(onProgress) {
+  if (!clipSessionPromise) {
+    clipSessionPromise = (async () => {
+      const ort = await getOrt();
+      const buf = await fetchArrayBufferWithProgress(MOBILECLIP_ONNX_PATH, onProgress);
+      const session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
+      clipInputName = session.inputNames[0];
+      clipOutputName = session.outputNames.find(n => /image_embeds|embeds|pooler_output/i.test(n)) || session.outputNames[0];
+      console.log('[clip] input=', clipInputName, 'output=', clipOutputName, 'all outputs=', session.outputNames);
+      return session;
+    })();
+  }
+  return clipSessionPromise;
 }
 
 const YOLO_INPUT_SIZE = 640;
@@ -793,20 +842,11 @@ async function init() {
     // vec length 512 => MobileCLIP2-S2's projected image_embeds dimension.
     // Mixing dimensions silently produces garbage cosine-similarity scores
     // (every crop collapsing onto the same "best" label) instead of an error.
-    modelPromise = CLIPVisionModelWithProjection.from_pretrained('plhery/mobileclip2-onnx', {
-      device: 'wasm', // matches the single-threaded wasm onnxruntime-web setup used for YOLO
-      dtype: 'fp32',
-      model_file_name: `${MOBILECLIP_SIZE}/vision_model`,
-      progress_callback: (p) => {
-        if (p.status === 'progress') {
-          statusText.textContent = `MobileCLIP2モデル読み込み中... ${p.file || ''} ${Math.round(p.progress || 0)}%`;
-          progressBarInner.style.width = Math.round(p.progress || 0) + '%';
-        } else if (p.status === 'initiate') {
-          statusText.textContent = `MobileCLIP2モデルを探しています... ${p.file || ''}`;
-        }
-      },
+    await getClipSession((frac) => {
+      const pct = Math.round(frac * 100);
+      statusText.textContent = `MobileCLIP2モデルを読み込み中... ${pct}%`;
+      progressBarInner.style.width = pct + '%';
     });
-    await modelPromise;
     progressBarInner.style.width = '100%';
 
     // check order: IndexedDB cache (instant, no network) -> bundled
