@@ -64,10 +64,16 @@
   <div id="cameraStartBox" style="border:1px dashed #3a3d45;border-radius:12px;padding:20px;text-align:center;cursor:pointer;max-width:900px;">
     <p style="margin:0;font-size:13px;color:#9aa0a6;">クリックしてカメラを起動</p>
   </div>
-  <div id="cameraWrap" style="display:none;position:relative;width:100%;max-width:900px;aspect-ratio:16/9;margin:0 auto;border-radius:12px;overflow:hidden;background:#000;">
-    <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+  <div id="cameraStage" style="display:none;align-items:center;gap:14px;width:100%;">
+    <div id="cameraWrap" style="position:relative;flex:0 1 900px;width:100%;max-width:900px;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#000;">
+      <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+      <img id="guideOverlay" src="./waku.png" style="display:none;position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;pointer-events:none;">
+    </div>
+    <button id="shutterBtn" aria-label="撮影して検出" style="display:none;flex-shrink:0;width:72px;height:72px;padding:0;border-radius:50%;border:4px solid #fff;background:transparent;cursor:pointer;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent;">
+      <span id="shutterInner" style="display:block;width:56px;height:56px;border-radius:50%;background:#fff;transition:transform 0.12s ease;"></span>
+    </button>
   </div>
-  <div id="cameraControls" style="display:none;margin-top:10px;display:flex;gap:8px;">
+  <div id="cameraControls" style="display:none;margin-top:10px;gap:8px;">
     <button id="captureBtn" style="background:#4ade80;color:#0f1115;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:bold;cursor:pointer;">撮影して検出</button>
     <button id="stopCamBtn" style="background:#2a2d35;color:#eee;border:none;border-radius:8px;padding:10px 16px;font-size:13px;cursor:pointer;">カメラを閉じる</button>
   </div>
@@ -305,13 +311,23 @@ async function tryLoadPrecomputed() {
 
 // ---- camera live capture ----
 const cameraStartBox = document.getElementById('cameraStartBox');
+const cameraStage = document.getElementById('cameraStage');
 const cameraWrap = document.getElementById('cameraWrap');
+const guideOverlay = document.getElementById('guideOverlay');
+const shutterBtn = document.getElementById('shutterBtn');
+const shutterInner = document.getElementById('shutterInner');
 const cameraControls = document.getElementById('cameraControls');
 const camVideo = document.getElementById('camVideo');
 const captureBtn = document.getElementById('captureBtn');
 const stopCamBtn = document.getElementById('stopCamBtn');
 const cameraError = document.getElementById('cameraError');
 let camStream = null;
+
+// Coarse-pointer devices (phones/tablets) get the on-screen guide overlay
+// (sized to the device via object-fit:contain, never stretched) plus an
+// iPhone-style shutter button instead of the text "撮影して検出" button.
+const isMobile = (typeof matchMedia === 'function' && matchMedia('(pointer:coarse)').matches)
+  || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 cameraStartBox.addEventListener('click', async () => {
   cameraError.style.display = 'none';
@@ -326,8 +342,16 @@ cameraStartBox.addEventListener('click', async () => {
     });
     camVideo.srcObject = camStream;
     cameraStartBox.style.display = 'none';
-    cameraWrap.style.display = 'block';
-    cameraControls.style.display = 'flex';
+    cameraStage.style.display = 'flex';
+    if (isMobile) {
+      guideOverlay.style.display = 'block';
+      shutterBtn.style.display = 'flex';
+      cameraControls.style.display = 'none'; // shutter button replaces the text button on mobile
+    } else {
+      guideOverlay.style.display = 'none';
+      shutterBtn.style.display = 'none';
+      cameraControls.style.display = 'flex';
+    }
   } catch (err) {
     cameraError.style.display = 'block';
     cameraError.textContent = 'カメラを起動できませんでした: ' + err.message + '(ブラウザのカメラ許可設定をご確認ください)';
@@ -339,11 +363,25 @@ function stopCamera() {
     camStream.getTracks().forEach(t => t.stop());
     camStream = null;
   }
-  cameraWrap.style.display = 'none';
+  cameraStage.style.display = 'none';
+  guideOverlay.style.display = 'none';
+  shutterBtn.style.display = 'none';
   cameraControls.style.display = 'none';
   cameraStartBox.style.display = 'block';
 }
 stopCamBtn.addEventListener('click', stopCamera);
+
+// Press feedback for the shutter button: shrink the inner white circle
+// while pressed (mirrors iOS's camera shutter), independent of which
+// pointer/touch type triggers it.
+function setShutterPressed(pressed) {
+  shutterInner.style.transform = pressed ? 'scale(0.8)' : 'scale(1)';
+}
+shutterBtn.addEventListener('pointerdown', () => setShutterPressed(true));
+shutterBtn.addEventListener('pointerup', () => setShutterPressed(false));
+shutterBtn.addEventListener('pointercancel', () => setShutterPressed(false));
+shutterBtn.addEventListener('pointerleave', () => setShutterPressed(false));
+shutterBtn.addEventListener('click', () => captureBtn.click());
 
 // ---- camera color-cast correction ("auto levels" black+white point) ----
 // A camera's auto white balance / ambient lighting shifts colors relative
