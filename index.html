@@ -4,6 +4,26 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>YOLO検出 + MobileCLIP2識別 デモ</title>
+<script>
+// Registers coi-serviceworker.js (see that file for why) as early as
+// possible so the one reload it needs happens before any model/asset
+// loading starts. No-op (and app works exactly as before) if service
+// workers aren't supported, if this is already running locally via
+// server_coi.py (already isolated), or if registration fails for any
+// reason -- this is purely a speed optimization, never a requirement.
+(function () {
+  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+  if (window.crossOriginIsolated) return;
+  if (window.self !== window.top) return; // don't mess with iframes/previews
+  if (sessionStorage.getItem('coiReloadDone') === '1') return; // avoid reload loops
+  navigator.serviceWorker.register('./coi-serviceworker.js').then(() => {
+    sessionStorage.setItem('coiReloadDone', '1');
+    window.location.reload();
+  }).catch((err) => {
+    console.warn('[coi] service worker registration failed, continuing without it:', err);
+  });
+})();
+</script>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f1115; color:#eee; margin:0; padding:16px; max-width:100vw; overflow-x:hidden; }
@@ -32,7 +52,7 @@
 <body>
 
 <h1>ブラウザ内YOLO検出 + MobileCLIP2識別 デモ</h1>
-<p class="sub">学習済みYOLOモデル(icon_detector.onnx)とMobileCLIP2識別モデル(mobileclip2_s2_vision_model.onnx)、どちらもindex.htmlと同じ場所に設置して画像から最大12体のアイコンを検出・切り抜き、事前計算済みのembeddings.json(MobileCLIP2埋め込みデータベース)と照合してポケモン名を表示します。3ファイルとも外部サイトから取得せず、同じホスティング上のファイルだけで動作します。</p>
+<p class="sub">学習済みYOLOモデル(icon_detector.onnx、index.htmlと同じ場所に設置)で画像から最大12体のアイコンを検出・切り抜き、事前計算済みのembeddings.json(MobileCLIP2埋め込みデータベース)と照合してポケモン名を表示します。MobileCLIP2本体はHugging Faceから読み込みます。embeddings.jsonはブラウザ内では生成しません。</p>
 
 <div id="status"><div class="spinner"></div><span id="statusText">モデルを読み込み中...</span></div>
 <div id="progressBarOuter"><div id="progressBarInner"></div></div>
@@ -44,16 +64,31 @@
   <div id="cameraStartBox" style="border:1px dashed #3a3d45;border-radius:12px;padding:20px;text-align:center;cursor:pointer;max-width:900px;">
     <p style="margin:0;font-size:13px;color:#9aa0a6;">クリックしてカメラを起動</p>
   </div>
-  <div id="cameraWrap" style="display:none;position:relative;width:100%;max-width:900px;aspect-ratio:16/9;margin:0 auto;border-radius:12px;overflow:hidden;background:#000;">
-    <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
-  </div>
-  <div id="cameraControls" style="display:none;margin-top:10px;display:flex;gap:8px;">
-    <button id="captureBtn" style="background:#4ade80;color:#0f1115;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:bold;cursor:pointer;">撮影して検出</button>
-    <button id="stopCamBtn" style="background:#2a2d35;color:#eee;border:none;border-radius:8px;padding:10px 16px;font-size:13px;cursor:pointer;">カメラを閉じる</button>
-  </div>
   <div id="cameraError" style="display:none;font-size:13px;color:#ff9a9a;margin-top:8px;"></div>
   <div id="cameraResult" style="margin-top:12px;"></div>
 </section>
+
+<!-- Fullscreen real-camera-app style capture overlay. Hidden until the
+     camera is started; then covers the whole viewport so the guide can be
+     laid out against the actual device resolution, like a native camera
+     app's viewfinder. -->
+<div id="cameraWrap" style="display:none;position:fixed;inset:0;background:#000;z-index:1000;">
+  <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+
+  <!-- Guide overlay image: sized/positioned by layoutCameraOverlay() so its
+       own aspect ratio is preserved and it sits in the left area, leaving
+       the shutter button its own space to the right, like a real camera
+       app's on-screen shutter next to the viewfinder. -->
+  <img id="camGuide" src="./capture_guide.png" alt="" style="position:absolute;pointer-events:none;">
+
+  <button id="closeCamBtn" aria-label="カメラを閉じる" style="position:absolute;top:14px;left:14px;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.35);color:#fff;font-size:18px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
+
+  <!-- Shutter button: positioned by layoutCameraOverlay() inside the empty
+       strip to the right of the guide, centered vertically. -->
+  <button id="captureBtn" aria-label="撮影して検出" style="position:absolute;width:70px;height:70px;border-radius:50%;background:#fff;border:4px solid rgba(255,255,255,0.5);box-shadow:0 0 0 2px rgba(0,0,0,0.4);cursor:pointer;padding:0;"></button>
+
+  <div id="cameraOverlayStatus" style="position:absolute;left:14px;bottom:14px;right:100px;font-size:12px;color:#ddd;background:rgba(0,0,0,0.45);border-radius:8px;padding:6px 10px;display:none;"></div>
+</div>
 
 <section>
   <h2>自分の画像で12体検出(ファイルアップロード)</h2>
@@ -65,14 +100,6 @@
 </section>
 
 <script type="module">
-// No @huggingface/transformers import needed anymore -- both the YOLO
-// detector and the MobileCLIP2 vision encoder are loaded as plain,
-// self-hosted ONNX files (mobileclip2_s2_vision_model.onnx, placed next to
-// index.html) via onnxruntime-web (see getOrt() below). This removes any
-// dependency on Hugging Face's hub/CDN at runtime -- required for GitHub
-// Pages hosting where every asset must be served from the same repo. The
-// browser's own HTTP cache still avoids re-downloading on repeat visits.
-
 const statusText = document.getElementById('statusText');
 const statusBox = document.getElementById('status');
 const progressBarInner = document.getElementById('progressBarInner');
@@ -100,11 +127,28 @@ function cosine(a, b) {
   return dot;
 }
 
-// ---- MobileCLIP2 (S2) species identification (runs on YOLO's cropped icons) ----
-const MOBILECLIP_SIZE = 's2';
-// Input size per MobileCLIP2 variant (must match compute_embeddings.py's
-// IMAGE_SIZE for whichever MOBILECLIP_SIZE is selected there): S0/S2=256, B/L14=224.
-const MOBILECLIP_IMAGE_SIZE = (MOBILECLIP_SIZE === 'b' || MOBILECLIP_SIZE === 'l14') ? 224 : 256;
+// ---- MobileCLIP2 species identification (runs on YOLO's cropped icons) ----
+// Real-device testing confirmed 'b' (330MB fp32) crashes the tab on iPhone
+// Safari right after the download reaches 100% (that's the moment the raw
+// downloaded bytes and the initialized WASM/WebGPU weight buffers are both
+// briefly held in memory at once -- Safari shows "問題が繰り返し起こりました",
+// its own OOM tab-crash page, not a catchable JS error).
+//
+// Now used on every device, not just mobile: a self-hosted fp16 export of
+// 'b' (see CLIP_FP16_MODEL_FILE -- half the memory footprint of fp32,
+// generated by convert_to_fp16.py), run through raw onnxruntime-web the
+// same way icon_detector.onnx is. This replaced an earlier setup where
+// desktop used transformers.js + the HF-hub fp32 weights directly -- one
+// single code path now for both, using the same embeddings_b.json database.
+const MOBILECLIP_SIZE = 'b';
+const EMBEDDINGS_FILE = './embeddings_b.json';
+// Must match compute_embeddings.py's IMAGE_SIZE for 'b' (224).
+const MOBILECLIP_IMAGE_SIZE = 224;
+// Hosted on Hugging Face, not alongside index.html on GitHub Pages --
+// GitHub has a hard 100MB-per-file limit and this is 173MB. Hugging Face's
+// resolve URLs serve with CORS headers, so a cross-origin fetch works.
+const CLIP_FP16_MODEL_FILE = 'https://huggingface.co/ketsugePLATINUM/mobileclip2-b-fp16/resolve/main/vision_model_b_fp16.onnx';
+let clipRawSession = null;
 let dbEmbeddings = null; // one entry per icon (normal AND shiny kept separate internally)
 
 // classify: match against every icon (normal+shiny), then collapse to one
@@ -122,62 +166,88 @@ function scoreVec(vec) {
   return Array.from(bestByName.values()).sort((a, b) => b.score - a.score).slice(0, 6);
 }
 
-// Preprocess a data URL into MobileCLIP2's expected input tensor by hand
-// (resize to MOBILECLIP_IMAGE_SIZE, scale to 0-1, no other normalization)
-// -- reuses the same canvasToCHWTensor() helper as the YOLO detector below,
-// since both models take a plain 0-1 scaled RGB CHW tensor. This keeps
-// preprocessing in lockstep with compute_embeddings.py's preprocess(),
-// which uses the identical mean=0/std=1, resize-then-scale approach.
-function dataUrlToClipTensor(dataUrl, ort) {
-  return loadImage(dataUrl).then(img => {
+// Preprocess a batch of data URLs into MobileCLIP2's expected input array
+// by hand (resize to MOBILECLIP_IMAGE_SIZE, scale to 0-1, no other
+// normalization) -- matches compute_embeddings.py's preprocess() exactly
+// (mean=0/std=1, resize-then-scale). Shared by buildClipPixelData's caller
+// only the Tensor *class* used to wrap this data differs (transformers.js's
+// Tensor vs raw onnxruntime-web's ort.Tensor), since raw-fp16 mode runs
+// through a separate onnxruntime-web instance (window.ort, shared with the
+// YOLO session) rather than transformers.js's bundled one.
+function buildClipPixelData(dataUrls) {
+  return Promise.all(dataUrls.map(loadImage)).then(imgs => {
     const size = MOBILECLIP_IMAGE_SIZE;
+    const plane = size * size;
+    const n = imgs.length;
     const canvas = document.createElement('canvas');
     canvas.width = size; canvas.height = size;
-    canvas.getContext('2d').drawImage(img, 0, 0, size, size);
-    return canvasToCHWTensor(canvas, ort);
+    const ctx = canvas.getContext('2d');
+    const floatData = new Float32Array(n * 3 * plane);
+    imgs.forEach((img, idx) => {
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(img, 0, 0, size, size);
+      const { data } = ctx.getImageData(0, 0, size, size);
+      const base = idx * 3 * plane;
+      for (let i = 0; i < plane; i++) {
+        floatData[base + i] = data[i * 4] / 255;                 // R
+        floatData[base + plane + i] = data[i * 4 + 1] / 255;     // G
+        floatData[base + plane * 2 + i] = data[i * 4 + 2] / 255; // B
+      }
+    });
+    return { floatData, n, size };
   });
 }
 
-function l2NormalizeArray(arr) {
-  let sumSq = 0;
-  for (let i = 0; i < arr.length; i++) sumSq += arr[i] * arr[i];
-  const norm = Math.sqrt(sumSq) || 1;
-  const out = new Array(arr.length);
-  for (let i = 0; i < arr.length; i++) out[i] = arr[i] / norm;
-  return out;
+// Picks (input name, output name) off a raw onnxruntime-web session the
+// same way compute_embeddings.py's pick_io_names() does on the Python
+// side, instead of hardcoding names that could differ between the fp32
+// and fp16-converted graphs.
+function pickIoNames(session) {
+  const inputName = session.inputNames[0];
+  let outputName = session.outputNames.find(n => /image_embeds|embeds|pooler_output/i.test(n));
+  if (!outputName) outputName = session.outputNames[0];
+  return { inputName, outputName };
 }
 
-async function classify(dataUrl) {
+// Runs MobileCLIP2 once on every crop from a photo (batched) and returns
+// one scored top-list per crop, in the same order as dataUrls. Runs
+// entirely through raw onnxruntime-web (the fp16 'b' session, shared
+// window.ort instance with YOLO) -- see getClipFp16Session() above.
+async function classifyBatch(dataUrls) {
+  if (dataUrls.length === 0) return [];
+
   const ort = await getOrt();
-  const session = await getClipSession();
-  const pixel_values = await dataUrlToClipTensor(dataUrl, ort);
-  const results = await session.run({ [clipInputName]: pixel_values });
-  // MobileCLIP2's vision model already returns a pooled, single vector per
-  // image (image_embeds) -- there's no last_hidden_state/CLS-token
-  // extraction needed here. The raw ONNX output is unnormalized, so
-  // L2-normalize before cosine similarity (matches compute_embeddings.py).
-  const vec = l2NormalizeArray(Array.from(results[clipOutputName].data));
+  const { floatData, n, size } = await buildClipPixelData(dataUrls);
+  const inputTensor = new ort.Tensor('float32', floatData, [n, 3, size, size]);
+  const { inputName, outputName } = pickIoNames(clipRawSession);
+  const outputs = await clipRawSession.run({ [inputName]: inputTensor });
+  const outTensor = outputs[outputName];
+  const dim = outTensor.dims[outTensor.dims.length - 1];
+  // README-documented behavior: output is unnormalized, so L2-normalize
+  // each row by hand (matches compute_embeddings.py's normalization).
+  const flat = new Float32Array(outTensor.data.length);
+  for (let i = 0; i < n; i++) {
+    let sumSq = 0;
+    for (let j = 0; j < dim; j++) { const v = outTensor.data[i * dim + j]; sumSq += v * v; }
+    const norm = Math.sqrt(sumSq) || 1;
+    for (let j = 0; j < dim; j++) flat[i * dim + j] = outTensor.data[i * dim + j] / norm;
+  }
+
   // Guard against silently-wrong results: if the live query vector's
   // dimension doesn't match the database's, cosine() would otherwise just
   // truncate/compare partial vectors and return meaningless scores that
   // consistently favor one arbitrary label instead of erroring out.
-  if (dbEmbeddings.length && vec.length !== dbEmbeddings[0].vec.length) {
-    throw new Error(`埋め込みの次元数が一致しません(クエリ:${vec.length}次元, DB:${dbEmbeddings[0].vec.length}次元)。embeddings.jsonを生成したモデルと表示中のモデルが違います。`);
+  if (dbEmbeddings.length && dim !== dbEmbeddings[0].vec.length) {
+    throw new Error(`埋め込みの次元数が一致しません(クエリ:${dim}次元, DB:${dbEmbeddings[0].vec.length}次元)。${EMBEDDINGS_FILE}を生成したモデルと表示中のモデルが違います。`);
   }
-  return scoreVec(vec);
-}
-
-// NOTE: passing an array of images through the model in one call did not
-// behave as a simple per-image batch under the old transformers.js pipeline
-// API -- keeping the same one-at-a-time processing here for safety even
-// though the raw ONNX session can technically accept a batch.
-async function classifyBatch(dataUrls) {
   const results = [];
-  for (const url of dataUrls) {
-    results.push(await classify(url));
+  for (let i = 0; i < n; i++) {
+    const vec = Array.from(flat.slice(i * dim, (i + 1) * dim));
+    results.push(scoreVec(vec));
   }
   return results;
 }
+
 
 // ---- automatic local cache (IndexedDB) for the DB embeddings ----
 // There's no bundled embeddings.json here, so the 480 reference icons are
@@ -186,7 +256,9 @@ async function classifyBatch(dataUrls) {
 // to the cached vectors.
 const IDB_DB_NAME = 'pokemon-clip-demo';
 const IDB_STORE = 'kv';
-const EMBEDDINGS_CACHE_KEY = 'dbEmbeddings_v_mobileclip2_s2_512d_128px_yolo_crop';
+function embeddingsCacheKey() {
+  return `dbEmbeddings_v_mobileclip2_${MOBILECLIP_SIZE}_512d_128px_yolo_crop`;
+}
 
 function idbOpen() {
   return new Promise((resolve, reject) => {
@@ -233,7 +305,7 @@ async function idbSet(key, value) {
 // if the file is missing, identification simply isn't available.
 async function tryLoadPrecomputed() {
   try {
-    const res = await fetch('./embeddings.json');
+    const res = await fetch(EMBEDDINGS_FILE);
     if (!res.ok) return null;
     const data = await res.json();
     if (!Array.isArray(data) || data.length === 0) return null;
@@ -243,16 +315,89 @@ async function tryLoadPrecomputed() {
   }
 }
 
-// ---- camera live capture ----
+// ---- camera live capture (fullscreen, real-camera-app style) ----
 const cameraStartBox = document.getElementById('cameraStartBox');
 const cameraWrap = document.getElementById('cameraWrap');
-const cameraControls = document.getElementById('cameraControls');
 const camVideo = document.getElementById('camVideo');
+const camGuide = document.getElementById('camGuide');
 const captureBtn = document.getElementById('captureBtn');
-const stopCamBtn = document.getElementById('stopCamBtn');
+const closeCamBtn = document.getElementById('closeCamBtn');
+const cameraOverlayStatus = document.getElementById('cameraOverlayStatus');
 const cameraError = document.getElementById('cameraError');
 const cameraResult = document.getElementById('cameraResult');
 let camStream = null;
+
+// capture_guide.png's own canvas size and the pixel rect of the guide frame
+// drawn inside it (measured directly from the asset). Used two ways:
+// 1) camGuide's aspect ratio (GUIDE_REF_W/GUIDE_REF_H) is preserved when we
+//    scale the whole PNG to fit the device screen ("ガイドの縦横比はそのまま").
+// 2) GUIDE_RECT is the frame's own bounding box within that canvas, used to
+//    know exactly what portion of the shot to hand to detection.
+const GUIDE_REF_W = 1920;
+const GUIDE_REF_H = 1080;
+const GUIDE_RECT = { x: 74, y: 149, w: 1860 - 74, h: 903 - 149 };
+
+// Width reserved on the right for the shutter button, like a real camera
+// app's on-screen shutter next to the viewfinder. Scales a bit with screen
+// width but stays within a sane range for thumb reach.
+function shutterZoneWidth(vw) {
+  return Math.min(160, Math.max(96, vw * 0.12));
+}
+
+// Last computed on-screen rect (in viewport/cameraWrap pixel coordinates)
+// that the guide frame occupies -- kept in sync by layoutCameraOverlay()
+// and read by captureBtn's click handler to know what to crop.
+let lastGuideScreenRect = null;
+
+function layoutCameraOverlay() {
+  const vw = cameraWrap.clientWidth;
+  const vh = cameraWrap.clientHeight;
+  if (!vw || !vh) return;
+
+  const zoneW = shutterZoneWidth(vw);
+  const availW = Math.max(1, vw - zoneW);
+  const availH = vh;
+
+  // Contain-fit the whole guide PNG (its own aspect ratio, unmodified) into
+  // the area left of the shutter zone, then center it there.
+  const guideAspect = GUIDE_REF_W / GUIDE_REF_H;
+  let dispW, dispH;
+  if (availW / availH > guideAspect) {
+    dispH = availH;
+    dispW = dispH * guideAspect;
+  } else {
+    dispW = availW;
+    dispH = dispW / guideAspect;
+  }
+  const guideLeft = (availW - dispW) / 2;
+  const guideTop = (availH - dispH) / 2;
+
+  camGuide.style.left = guideLeft + 'px';
+  camGuide.style.top = guideTop + 'px';
+  camGuide.style.width = dispW + 'px';
+  camGuide.style.height = dispH + 'px';
+
+  // The frame's own bounding box, mapped from the PNG's reference canvas
+  // into on-screen pixels, for use as the detection crop at capture time.
+  const scale = dispW / GUIDE_REF_W;
+  lastGuideScreenRect = {
+    x: guideLeft + GUIDE_RECT.x * scale,
+    y: guideTop + GUIDE_RECT.y * scale,
+    w: GUIDE_RECT.w * scale,
+    h: GUIDE_RECT.h * scale
+  };
+
+  // Shutter button: centered in the reserved right-hand strip, vertically
+  // centered on screen -- same spot a real camera app puts it.
+  const btnSize = 70;
+  captureBtn.style.left = (vw - zoneW + (zoneW - btnSize) / 2) + 'px';
+  captureBtn.style.top = (vh / 2 - btnSize / 2) + 'px';
+}
+
+window.addEventListener('resize', layoutCameraOverlay);
+window.addEventListener('orientationchange', () => setTimeout(layoutCameraOverlay, 150));
+if (camGuide.complete) layoutCameraOverlay();
+else camGuide.addEventListener('load', layoutCameraOverlay);
 
 cameraStartBox.addEventListener('click', async () => {
   cameraError.style.display = 'none';
@@ -266,9 +411,13 @@ cameraStartBox.addEventListener('click', async () => {
       }
     });
     camVideo.srcObject = camStream;
-    cameraStartBox.style.display = 'none';
     cameraWrap.style.display = 'block';
-    cameraControls.style.display = 'flex';
+    // Best-effort landscape lock; the guide/shutter layout still works fine
+    // if this fails or isn't supported (iOS Safari has no orientation lock).
+    if (screen.orientation && screen.orientation.lock) {
+      screen.orientation.lock('landscape').catch(() => {});
+    }
+    requestAnimationFrame(layoutCameraOverlay);
   } catch (err) {
     cameraError.style.display = 'block';
     cameraError.textContent = 'カメラを起動できませんでした: ' + err.message + '(ブラウザのカメラ許可設定をご確認ください)';
@@ -281,10 +430,37 @@ function stopCamera() {
     camStream = null;
   }
   cameraWrap.style.display = 'none';
-  cameraControls.style.display = 'none';
-  cameraStartBox.style.display = 'block';
+  cameraOverlayStatus.style.display = 'none';
+  if (screen.orientation && screen.orientation.unlock) {
+    try { screen.orientation.unlock(); } catch (e) {}
+  }
 }
-stopCamBtn.addEventListener('click', stopCamera);
+closeCamBtn.addEventListener('click', stopCamera);
+
+// Maps a rect in on-screen/container pixel coordinates (as produced by
+// layoutCameraOverlay(), e.g. lastGuideScreenRect) to the corresponding
+// source-pixel rect inside the <video>'s native frame, accounting for the
+// crop that object-fit:cover applies when the video's aspect ratio doesn't
+// exactly match the container's.
+function screenRectToVideoRect(rect, container, video) {
+  const cw = container.clientWidth, ch = container.clientHeight;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const videoAspect = vw / vh, containerAspect = cw / ch;
+  let scale, offsetX = 0, offsetY = 0;
+  if (videoAspect > containerAspect) {
+    scale = ch / vh;
+    offsetX = (vw * scale - cw) / 2;
+  } else {
+    scale = cw / vw;
+    offsetY = (vh * scale - ch) / 2;
+  }
+  return {
+    x: (rect.x + offsetX) / scale,
+    y: (rect.y + offsetY) / scale,
+    w: rect.w / scale,
+    h: rect.h / scale
+  };
+}
 
 // ---- camera color-cast correction ("auto levels" black+white point) ----
 // A camera's auto white balance / ambient lighting shifts colors relative
@@ -365,13 +541,20 @@ function getCv() {
 
 // ---- onnxruntime-web + trained YOLO icon detector ----
 let ortReadyPromise = null;
-// Multi-threaded wasm tries to reserve a large SharedArrayBuffer up front,
-// which throws "RangeError: Out of memory" / "no available backend found"
-// on memory-constrained mobile browsers -- this page also isn't
-// cross-origin-isolated, which threads require anyway. Forcing
-// single-threaded wasm avoids that large up-front allocation.
+// Multi-threaded wasm reserves its linear memory as one big up-front
+// SharedArrayBuffer, sized roughly per thread. On memory-constrained
+// browsers that up-front reservation itself can fail outright
+// ("Array buffer allocation failed"/"RangeError: Out of memory") even
+// though threads are technically available (crossOriginIsolated=true).
+// Requesting every core (some devices report 8+) made this worse; capping
+// the request keeps the up-front allocation small, and getYoloSession()/
+// the MobileCLIP2 loader below both additionally retry at numThreads=1
+// (the original, always-safe behavior) if even that fails.
+const WASM_THREAD_CAP = 4;
 function configureOrt(ort) {
-  ort.env.wasm.numThreads = 1;
+  const isolated = typeof self !== 'undefined' && self.crossOriginIsolated;
+  const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+  ort.env.wasm.numThreads = isolated ? Math.min(WASM_THREAD_CAP, Math.max(1, cores)) : 1;
   ort.env.wasm.proxy = false;
 }
 function getOrt() {
@@ -397,62 +580,57 @@ function getYoloSession() {
   if (!yoloSessionPromise) {
     yoloSessionPromise = (async () => {
       const ort = await getOrt();
-      return await ort.InferenceSession.create('./icon_detector.onnx', {
-        executionProviders: ['wasm']
-      });
+      // Same ONNX weights in every branch below -- WebGPU/thread-count are
+      // purely about *where*/*how parallel* the identical graph runs, so
+      // none of this fallback ladder changes results, only speed.
+      const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
+      const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      try {
+        return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: providers });
+      } catch (err) {
+        console.warn('[yolo] 初回読み込みに失敗、WASMのみで再試行します:', err);
+      }
+      try {
+        return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: ['wasm'] });
+      } catch (err) {
+        console.warn('[yolo] マルチスレッドWASMにも失敗、シングルスレッドに切り替えます:', err);
+      }
+      ort.env.wasm.numThreads = 1; // last-resort, always-safe fallback
+      return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: ['wasm'] });
     })();
   }
   return yoloSessionPromise;
 }
 
-// Self-hosted MobileCLIP2 (S2) vision encoder. Place the file
-// "mobileclip2_s2_vision_model.onnx" next to index.html (it's the exact
-// same file compute_embeddings.py downloads to
-// ./model_cache/mobileclip2_s2/vision_model.onnx -- just copy it over).
-// Loaded as a plain ONNX Runtime session (no Hugging Face hub/CDN
-// involved), so this works on GitHub Pages or any static host with
-// nothing but these files in the repo.
-const MOBILECLIP_ONNX_PATH = './mobileclip2_s2_vision_model.onnx';
-let clipSessionPromise = null;
-let clipInputName = null;
-let clipOutputName = null;
-
-// Manual fetch-with-progress instead of ort.InferenceSession.create(url),
-// since the latter gives no download-progress signal -- this keeps the
-// existing progress bar working for the ~136MB download.
-async function fetchArrayBufferWithProgress(url, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`モデルファイルの取得に失敗しました: ${url} (HTTP ${res.status})。index.htmlと同じ場所に mobileclip2_s2_vision_model.onnx を置き忘れていませんか?`);
-  const total = Number(res.headers.get('content-length')) || 0;
-  const reader = res.body.getReader();
-  const chunks = [];
-  let received = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    if (total && onProgress) onProgress(received / total);
-  }
-  const buf = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) { buf.set(chunk, offset); offset += chunk.length; }
-  return buf.buffer;
-}
-
-function getClipSession(onProgress) {
-  if (!clipSessionPromise) {
-    clipSessionPromise = (async () => {
+// Loads the self-hosted fp16 export of MobileCLIP2-B (see
+// convert_to_fp16.py) through the SAME onnxruntime-web instance as YOLO
+// above (window.ort), rather than transformers.js's separately-bundled
+// one. This is deliberate, not just for consistency: it means mobile only
+// ever has ONE onnxruntime-web wasm runtime loaded at a time (shared by
+// YOLO + CLIP) instead of two, which is itself a meaningful memory saving
+// on top of the fp32->fp16 halving.
+let clipFp16SessionPromise = null;
+function getClipFp16Session() {
+  if (!clipFp16SessionPromise) {
+    clipFp16SessionPromise = (async () => {
       const ort = await getOrt();
-      const buf = await fetchArrayBufferWithProgress(MOBILECLIP_ONNX_PATH, onProgress);
-      const session = await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
-      clipInputName = session.inputNames[0];
-      clipOutputName = session.outputNames.find(n => /image_embeds|embeds|pooler_output/i.test(n)) || session.outputNames[0];
-      console.log('[clip] input=', clipInputName, 'output=', clipOutputName, 'all outputs=', session.outputNames);
-      return session;
+      const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
+      const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      try {
+        return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: providers });
+      } catch (err) {
+        console.warn('[clip-fp16] 初回読み込みに失敗、WASMのみで再試行します:', err);
+      }
+      try {
+        return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: ['wasm'] });
+      } catch (err) {
+        console.warn('[clip-fp16] マルチスレッドWASMにも失敗、シングルスレッドに切り替えます:', err);
+      }
+      ort.env.wasm.numThreads = 1; // last-resort, always-safe fallback
+      return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: ['wasm'] });
     })();
   }
-  return clipSessionPromise;
+  return clipFp16SessionPromise;
 }
 
 const YOLO_INPUT_SIZE = 640;
@@ -761,13 +939,27 @@ function renderGroupResults(container, groupTitle, entries) {
 }
 
 captureBtn.addEventListener('click', async () => {
-  const canvas = document.createElement('canvas');
-  canvas.width = camVideo.videoWidth;
-  canvas.height = camVideo.videoHeight;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
+  captureBtn.disabled = true;
+  cameraOverlayStatus.style.display = 'block';
+  cameraOverlayStatus.textContent = '検出・識別中...';
 
-  cameraResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
+  // Crop to exactly the guide frame's region (mapped through the video's
+  // object-fit:cover geometry), so what gets detected is what the user
+  // actually aligned inside the on-screen guide, not the full raw shot.
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  if (lastGuideScreenRect) {
+    const src = screenRectToVideoRect(lastGuideScreenRect, cameraWrap, camVideo);
+    canvas.width = Math.round(src.w);
+    canvas.height = Math.round(src.h);
+    ctx.drawImage(camVideo, src.x, src.y, src.w, src.h, 0, 0, canvas.width, canvas.height);
+  } else {
+    // Fallback (guide layout not ready yet for some reason): use the full frame.
+    canvas.width = camVideo.videoWidth;
+    canvas.height = camVideo.videoHeight;
+    ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
+  }
+
   autoWhiteBalance(canvas);
 
   let result = null;
@@ -778,6 +970,10 @@ captureBtn.addEventListener('click', async () => {
     console.error(err);
     errorMsg = (err && err.message) ? err.message : String(err);
   }
+
+  captureBtn.disabled = false;
+  stopCamera();
+  cameraResult.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   if (result) {
     cameraResult.innerHTML = '';
@@ -837,39 +1033,32 @@ async function init() {
     statusText.textContent = 'YOLOモデルを読み込み中...';
     await getYoloSession();
 
-    statusText.textContent = 'MobileCLIP2モデルを読み込み中(初回は136MB程度)...';
-    // NOTE: must match whatever model embeddings.json was generated with.
-    // vec length 512 => MobileCLIP2-S2's projected image_embeds dimension.
-    // Mixing dimensions silently produces garbage cosine-similarity scores
-    // (every crop collapsing onto the same "best" label) instead of an error.
-    await getClipSession((frac) => {
-      const pct = Math.round(frac * 100);
-      statusText.textContent = `MobileCLIP2モデルを読み込み中... ${pct}%`;
-      progressBarInner.style.width = pct + '%';
-    });
+    statusText.textContent = 'MobileCLIP2モデル(B, fp16)を読み込み中(約165MB)...';
+    clipRawSession = await getClipFp16Session();
     progressBarInner.style.width = '100%';
 
     // check order: IndexedDB cache (instant, no network) -> bundled
-    // embeddings.json. No in-browser computation fallback -- embeddings.json
-    // (from compute_embeddings.py) is the only source of truth.
-    const cached = await idbGet(EMBEDDINGS_CACHE_KEY);
+    // EMBEDDINGS_FILE. No in-browser computation fallback -- the file (from
+    // compute_embeddings.py) is the only source of truth.
+    const cacheKey = embeddingsCacheKey();
+    const cached = await idbGet(cacheKey);
     const precomputed = cached || await tryLoadPrecomputed();
 
     if (!precomputed) {
       statusBox.querySelector('.spinner').style.display = 'none';
       document.getElementById('progressBarOuter').style.display = 'none';
-      statusText.textContent = 'embeddings.jsonが見つかりません。compute_embeddings.py(Python)を実行してembeddings.jsonを生成し、index.htmlと同じフォルダに置いてから読み込み直してください。';
+      statusText.textContent = `${EMBEDDINGS_FILE}が見つかりません。compute_embeddings.py(Python)をMOBILECLIP_SIZE="${MOBILECLIP_SIZE}"で実行して${EMBEDDINGS_FILE}を生成し、index.htmlと同じフォルダに置いてから読み込み直してください。`;
       modelError.style.display = 'block';
       modelError.textContent = '';
-      uploadHint.textContent = 'embeddings.jsonが必要です。アップロード判定は利用できません。';
+      uploadHint.textContent = `${EMBEDDINGS_FILE}が必要です。アップロード判定は利用できません。`;
       return;
     }
 
     dbEmbeddings = precomputed;
     statusText.textContent = cached
       ? `キャッシュ済みの埋め込みを読み込みました(${dbEmbeddings.length}件)`
-      : `embeddings.jsonを読み込みました(${dbEmbeddings.length}件)`;
-    if (!cached) await idbSet(EMBEDDINGS_CACHE_KEY, dbEmbeddings);
+      : `${EMBEDDINGS_FILE}を読み込みました(${dbEmbeddings.length}件)`;
+    if (!cached) await idbSet(cacheKey, dbEmbeddings);
 
     statusBox.style.display = 'none';
     document.getElementById('progressBarOuter').style.display = 'none';
