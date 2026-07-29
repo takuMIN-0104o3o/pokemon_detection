@@ -64,31 +64,16 @@
   <div id="cameraStartBox" style="border:1px dashed #3a3d45;border-radius:12px;padding:20px;text-align:center;cursor:pointer;max-width:900px;">
     <p style="margin:0;font-size:13px;color:#9aa0a6;">クリックしてカメラを起動</p>
   </div>
+  <div id="cameraWrap" style="display:none;position:relative;width:100%;max-width:900px;aspect-ratio:16/9;margin:0 auto;border-radius:12px;overflow:hidden;background:#000;">
+    <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+  </div>
+  <div id="cameraControls" style="display:none;margin-top:10px;display:flex;gap:8px;">
+    <button id="captureBtn" style="background:#4ade80;color:#0f1115;border:none;border-radius:8px;padding:10px 16px;font-size:13px;font-weight:bold;cursor:pointer;">撮影して検出</button>
+    <button id="stopCamBtn" style="background:#2a2d35;color:#eee;border:none;border-radius:8px;padding:10px 16px;font-size:13px;cursor:pointer;">カメラを閉じる</button>
+  </div>
   <div id="cameraError" style="display:none;font-size:13px;color:#ff9a9a;margin-top:8px;"></div>
   <div id="cameraResult" style="margin-top:12px;"></div>
 </section>
-
-<!-- Fullscreen real-camera-app style capture overlay. Hidden until the
-     camera is started; then covers the whole viewport so the guide can be
-     laid out against the actual device resolution, like a native camera
-     app's viewfinder. -->
-<div id="cameraWrap" style="display:none;position:fixed;inset:0;background:#000;z-index:1000;">
-  <video id="camVideo" autoplay playsinline muted style="position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
-
-  <!-- Guide overlay image: sized/positioned by layoutCameraOverlay() so its
-       own aspect ratio is preserved and it sits in the left area, leaving
-       the shutter button its own space to the right, like a real camera
-       app's on-screen shutter next to the viewfinder. -->
-  <img id="camGuide" src="./capture_guide.png" alt="" style="position:absolute;pointer-events:none;">
-
-  <button id="closeCamBtn" aria-label="カメラを閉じる" style="position:absolute;top:14px;left:14px;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.35);color:#fff;font-size:18px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;">✕</button>
-
-  <!-- Shutter button: positioned by layoutCameraOverlay() inside the empty
-       strip to the right of the guide, centered vertically. -->
-  <button id="captureBtn" aria-label="撮影して検出" style="position:absolute;width:70px;height:70px;border-radius:50%;background:#fff;border:4px solid rgba(255,255,255,0.5);box-shadow:0 0 0 2px rgba(0,0,0,0.4);cursor:pointer;padding:0;"></button>
-
-  <div id="cameraOverlayStatus" style="position:absolute;left:14px;bottom:14px;right:100px;font-size:12px;color:#ddd;background:rgba(0,0,0,0.45);border-radius:8px;padding:6px 10px;display:none;"></div>
-</div>
 
 <section>
   <h2>自分の画像で12体検出(ファイルアップロード)</h2>
@@ -315,89 +300,16 @@ async function tryLoadPrecomputed() {
   }
 }
 
-// ---- camera live capture (fullscreen, real-camera-app style) ----
+// ---- camera live capture ----
 const cameraStartBox = document.getElementById('cameraStartBox');
 const cameraWrap = document.getElementById('cameraWrap');
+const cameraControls = document.getElementById('cameraControls');
 const camVideo = document.getElementById('camVideo');
-const camGuide = document.getElementById('camGuide');
 const captureBtn = document.getElementById('captureBtn');
-const closeCamBtn = document.getElementById('closeCamBtn');
-const cameraOverlayStatus = document.getElementById('cameraOverlayStatus');
+const stopCamBtn = document.getElementById('stopCamBtn');
 const cameraError = document.getElementById('cameraError');
 const cameraResult = document.getElementById('cameraResult');
 let camStream = null;
-
-// capture_guide.png's own canvas size and the pixel rect of the guide frame
-// drawn inside it (measured directly from the asset). Used two ways:
-// 1) camGuide's aspect ratio (GUIDE_REF_W/GUIDE_REF_H) is preserved when we
-//    scale the whole PNG to fit the device screen ("ガイドの縦横比はそのまま").
-// 2) GUIDE_RECT is the frame's own bounding box within that canvas, used to
-//    know exactly what portion of the shot to hand to detection.
-const GUIDE_REF_W = 1920;
-const GUIDE_REF_H = 1080;
-const GUIDE_RECT = { x: 74, y: 149, w: 1860 - 74, h: 903 - 149 };
-
-// Width reserved on the right for the shutter button, like a real camera
-// app's on-screen shutter next to the viewfinder. Scales a bit with screen
-// width but stays within a sane range for thumb reach.
-function shutterZoneWidth(vw) {
-  return Math.min(160, Math.max(96, vw * 0.12));
-}
-
-// Last computed on-screen rect (in viewport/cameraWrap pixel coordinates)
-// that the guide frame occupies -- kept in sync by layoutCameraOverlay()
-// and read by captureBtn's click handler to know what to crop.
-let lastGuideScreenRect = null;
-
-function layoutCameraOverlay() {
-  const vw = cameraWrap.clientWidth;
-  const vh = cameraWrap.clientHeight;
-  if (!vw || !vh) return;
-
-  const zoneW = shutterZoneWidth(vw);
-  const availW = Math.max(1, vw - zoneW);
-  const availH = vh;
-
-  // Contain-fit the whole guide PNG (its own aspect ratio, unmodified) into
-  // the area left of the shutter zone, then center it there.
-  const guideAspect = GUIDE_REF_W / GUIDE_REF_H;
-  let dispW, dispH;
-  if (availW / availH > guideAspect) {
-    dispH = availH;
-    dispW = dispH * guideAspect;
-  } else {
-    dispW = availW;
-    dispH = dispW / guideAspect;
-  }
-  const guideLeft = (availW - dispW) / 2;
-  const guideTop = (availH - dispH) / 2;
-
-  camGuide.style.left = guideLeft + 'px';
-  camGuide.style.top = guideTop + 'px';
-  camGuide.style.width = dispW + 'px';
-  camGuide.style.height = dispH + 'px';
-
-  // The frame's own bounding box, mapped from the PNG's reference canvas
-  // into on-screen pixels, for use as the detection crop at capture time.
-  const scale = dispW / GUIDE_REF_W;
-  lastGuideScreenRect = {
-    x: guideLeft + GUIDE_RECT.x * scale,
-    y: guideTop + GUIDE_RECT.y * scale,
-    w: GUIDE_RECT.w * scale,
-    h: GUIDE_RECT.h * scale
-  };
-
-  // Shutter button: centered in the reserved right-hand strip, vertically
-  // centered on screen -- same spot a real camera app puts it.
-  const btnSize = 70;
-  captureBtn.style.left = (vw - zoneW + (zoneW - btnSize) / 2) + 'px';
-  captureBtn.style.top = (vh / 2 - btnSize / 2) + 'px';
-}
-
-window.addEventListener('resize', layoutCameraOverlay);
-window.addEventListener('orientationchange', () => setTimeout(layoutCameraOverlay, 150));
-if (camGuide.complete) layoutCameraOverlay();
-else camGuide.addEventListener('load', layoutCameraOverlay);
 
 cameraStartBox.addEventListener('click', async () => {
   cameraError.style.display = 'none';
@@ -411,13 +323,9 @@ cameraStartBox.addEventListener('click', async () => {
       }
     });
     camVideo.srcObject = camStream;
+    cameraStartBox.style.display = 'none';
     cameraWrap.style.display = 'block';
-    // Best-effort landscape lock; the guide/shutter layout still works fine
-    // if this fails or isn't supported (iOS Safari has no orientation lock).
-    if (screen.orientation && screen.orientation.lock) {
-      screen.orientation.lock('landscape').catch(() => {});
-    }
-    requestAnimationFrame(layoutCameraOverlay);
+    cameraControls.style.display = 'flex';
   } catch (err) {
     cameraError.style.display = 'block';
     cameraError.textContent = 'カメラを起動できませんでした: ' + err.message + '(ブラウザのカメラ許可設定をご確認ください)';
@@ -430,37 +338,10 @@ function stopCamera() {
     camStream = null;
   }
   cameraWrap.style.display = 'none';
-  cameraOverlayStatus.style.display = 'none';
-  if (screen.orientation && screen.orientation.unlock) {
-    try { screen.orientation.unlock(); } catch (e) {}
-  }
+  cameraControls.style.display = 'none';
+  cameraStartBox.style.display = 'block';
 }
-closeCamBtn.addEventListener('click', stopCamera);
-
-// Maps a rect in on-screen/container pixel coordinates (as produced by
-// layoutCameraOverlay(), e.g. lastGuideScreenRect) to the corresponding
-// source-pixel rect inside the <video>'s native frame, accounting for the
-// crop that object-fit:cover applies when the video's aspect ratio doesn't
-// exactly match the container's.
-function screenRectToVideoRect(rect, container, video) {
-  const cw = container.clientWidth, ch = container.clientHeight;
-  const vw = video.videoWidth, vh = video.videoHeight;
-  const videoAspect = vw / vh, containerAspect = cw / ch;
-  let scale, offsetX = 0, offsetY = 0;
-  if (videoAspect > containerAspect) {
-    scale = ch / vh;
-    offsetX = (vw * scale - cw) / 2;
-  } else {
-    scale = cw / vw;
-    offsetY = (vh * scale - ch) / 2;
-  }
-  return {
-    x: (rect.x + offsetX) / scale,
-    y: (rect.y + offsetY) / scale,
-    w: rect.w / scale,
-    h: rect.h / scale
-  };
-}
+stopCamBtn.addEventListener('click', stopCamera);
 
 // ---- camera color-cast correction ("auto levels" black+white point) ----
 // A camera's auto white balance / ambient lighting shifts colors relative
@@ -539,6 +420,32 @@ function getCv() {
   return cvReadyPromise;
 }
 
+// ---- persistent model-bytes cache (Cache Storage API) ----
+// Unlike embeddings (cached via IndexedDB above), the ONNX model files
+// themselves were previously re-fetched from network every time the
+// browser/tab restarted, since InferenceSession.create(url) relied purely
+// on the browser's implicit HTTP cache (not guaranteed to survive restarts,
+// especially for the ~165MB Hugging Face-hosted CLIP model). This caches
+// the raw bytes explicitly so a restart only needs a cache lookup.
+const MODEL_CACHE_NAME = 'onnx-model-cache-v1';
+async function fetchModelBytes(url) {
+  try {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    const hit = await cache.match(url);
+    if (hit) return await hit.arrayBuffer();
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
+    // Clone before consuming: one copy goes to cache.put, one is read here.
+    const toCache = res.clone();
+    cache.put(url, toCache).catch(err => console.warn('[model-cache] put failed:', err));
+    return await res.arrayBuffer();
+  } catch (err) {
+    console.warn('[model-cache] falling back to uncached fetch:', err);
+    const res = await fetch(url);
+    return await res.arrayBuffer();
+  }
+}
+
 // ---- onnxruntime-web + trained YOLO icon detector ----
 let ortReadyPromise = null;
 // Multi-threaded wasm reserves its linear memory as one big up-front
@@ -585,18 +492,19 @@ function getYoloSession() {
       // none of this fallback ladder changes results, only speed.
       const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
       const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      const modelBytes = await fetchModelBytes('./icon_detector.onnx');
       try {
-        return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: providers });
+        return await ort.InferenceSession.create(modelBytes, { executionProviders: providers });
       } catch (err) {
         console.warn('[yolo] 初回読み込みに失敗、WASMのみで再試行します:', err);
       }
       try {
-        return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: ['wasm'] });
+        return await ort.InferenceSession.create(modelBytes, { executionProviders: ['wasm'] });
       } catch (err) {
         console.warn('[yolo] マルチスレッドWASMにも失敗、シングルスレッドに切り替えます:', err);
       }
       ort.env.wasm.numThreads = 1; // last-resort, always-safe fallback
-      return await ort.InferenceSession.create('./icon_detector.onnx', { executionProviders: ['wasm'] });
+      return await ort.InferenceSession.create(modelBytes, { executionProviders: ['wasm'] });
     })();
   }
   return yoloSessionPromise;
@@ -616,18 +524,19 @@ function getClipFp16Session() {
       const ort = await getOrt();
       const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
       const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      const modelBytes = await fetchModelBytes(CLIP_FP16_MODEL_FILE);
       try {
-        return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: providers });
+        return await ort.InferenceSession.create(modelBytes, { executionProviders: providers });
       } catch (err) {
         console.warn('[clip-fp16] 初回読み込みに失敗、WASMのみで再試行します:', err);
       }
       try {
-        return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: ['wasm'] });
+        return await ort.InferenceSession.create(modelBytes, { executionProviders: ['wasm'] });
       } catch (err) {
         console.warn('[clip-fp16] マルチスレッドWASMにも失敗、シングルスレッドに切り替えます:', err);
       }
       ort.env.wasm.numThreads = 1; // last-resort, always-safe fallback
-      return await ort.InferenceSession.create(CLIP_FP16_MODEL_FILE, { executionProviders: ['wasm'] });
+      return await ort.InferenceSession.create(modelBytes, { executionProviders: ['wasm'] });
     })();
   }
   return clipFp16SessionPromise;
@@ -939,27 +848,13 @@ function renderGroupResults(container, groupTitle, entries) {
 }
 
 captureBtn.addEventListener('click', async () => {
-  captureBtn.disabled = true;
-  cameraOverlayStatus.style.display = 'block';
-  cameraOverlayStatus.textContent = '検出・識別中...';
-
-  // Crop to exactly the guide frame's region (mapped through the video's
-  // object-fit:cover geometry), so what gets detected is what the user
-  // actually aligned inside the on-screen guide, not the full raw shot.
   const canvas = document.createElement('canvas');
+  canvas.width = camVideo.videoWidth;
+  canvas.height = camVideo.videoHeight;
   const ctx = canvas.getContext('2d');
-  if (lastGuideScreenRect) {
-    const src = screenRectToVideoRect(lastGuideScreenRect, cameraWrap, camVideo);
-    canvas.width = Math.round(src.w);
-    canvas.height = Math.round(src.h);
-    ctx.drawImage(camVideo, src.x, src.y, src.w, src.h, 0, 0, canvas.width, canvas.height);
-  } else {
-    // Fallback (guide layout not ready yet for some reason): use the full frame.
-    canvas.width = camVideo.videoWidth;
-    canvas.height = camVideo.videoHeight;
-    ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
-  }
+  ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
 
+  cameraResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
   autoWhiteBalance(canvas);
 
   let result = null;
@@ -970,10 +865,6 @@ captureBtn.addEventListener('click', async () => {
     console.error(err);
     errorMsg = (err && err.message) ? err.message : String(err);
   }
-
-  captureBtn.disabled = false;
-  stopCamera();
-  cameraResult.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   if (result) {
     cameraResult.innerHTML = '';
