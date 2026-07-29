@@ -72,7 +72,6 @@
     <button id="stopCamBtn" style="background:#2a2d35;color:#eee;border:none;border-radius:8px;padding:10px 16px;font-size:13px;cursor:pointer;">カメラを閉じる</button>
   </div>
   <div id="cameraError" style="display:none;font-size:13px;color:#ff9a9a;margin-top:8px;"></div>
-  <div id="cameraResult" style="margin-top:12px;"></div>
 </section>
 
 <section>
@@ -81,7 +80,11 @@
     <p style="margin:0;font-size:13px;color:#9aa0a6;" id="uploadHint">モデル読み込み完了までお待ちください...</p>
     <input type="file" id="fileInput" accept="image/*" style="display:none;">
   </div>
-  <div id="uploadResult" style="margin-top:12px;"></div>
+</section>
+
+<section>
+  <h2>検出結果</h2>
+  <div id="detectionResult" style="margin-top:12px;"></div>
 </section>
 
 <script type="module">
@@ -92,7 +95,7 @@ const modelError = document.getElementById('modelError');
 const fileInput = document.getElementById('fileInput');
 const uploadBox = document.getElementById('uploadBox');
 const uploadHint = document.getElementById('uploadHint');
-const uploadResult = document.getElementById('uploadResult');
+const detectionResult = document.getElementById('detectionResult');
 
 function loadImage(src) {
   return new Promise((res, rej) => {
@@ -308,7 +311,6 @@ const camVideo = document.getElementById('camVideo');
 const captureBtn = document.getElementById('captureBtn');
 const stopCamBtn = document.getElementById('stopCamBtn');
 const cameraError = document.getElementById('cameraError');
-const cameraResult = document.getElementById('cameraResult');
 let camStream = null;
 
 cameraStartBox.addEventListener('click', async () => {
@@ -854,8 +856,7 @@ captureBtn.addEventListener('click', async () => {
   const ctx = canvas.getContext('2d');
   ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
 
-  uploadResult.innerHTML = ''; // show only the method just used
-  cameraResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
+  detectionResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
   autoWhiteBalance(canvas);
 
   let result = null;
@@ -868,13 +869,13 @@ captureBtn.addEventListener('click', async () => {
   }
 
   if (result) {
-    cameraResult.innerHTML = '';
-    renderGroupResults(cameraResult, '味方6体', result.own);
-    renderGroupResults(cameraResult, '相手6体', result.opp);
+    detectionResult.innerHTML = '';
+    renderGroupResults(detectionResult, '味方6体', result.own);
+    renderGroupResults(detectionResult, '相手6体', result.opp);
   } else if (errorMsg) {
-    cameraResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
+    detectionResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
   } else {
-    cameraResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写るように撮り直してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
+    detectionResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写るように撮り直してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
   }
 });
 
@@ -893,8 +894,7 @@ fileInput.addEventListener('change', async (e) => {
   canvas.height = img.naturalHeight;
   canvas.getContext('2d').drawImage(img, 0, 0);
 
-  cameraResult.innerHTML = ''; // show only the method just used
-  uploadResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
+  detectionResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
 
   let result = null;
   let errorMsg = null;
@@ -906,13 +906,13 @@ fileInput.addEventListener('change', async (e) => {
   }
 
   if (result) {
-    uploadResult.innerHTML = '';
-    renderGroupResults(uploadResult, '味方6体', result.own);
-    renderGroupResults(uploadResult, '相手6体', result.opp);
+    detectionResult.innerHTML = '';
+    renderGroupResults(detectionResult, '味方6体', result.own);
+    renderGroupResults(detectionResult, '相手6体', result.opp);
   } else if (errorMsg) {
-    uploadResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
+    detectionResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">エラー: ${errorMsg}</p>`;
   } else {
-    uploadResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写っている画像で試してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
+    detectionResult.innerHTML = `<p style="font-size:13px;color:#ff9a9a;">12体を検出できませんでした。画面全体が縦(高さ方向)いっぱいに、まっすぐ写っている画像で試してください。${lastDetectDebug ? '<br>詳細: ' + lastDetectDebug : ''}</p>`;
   }
 });
 
