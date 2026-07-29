@@ -854,6 +854,7 @@ captureBtn.addEventListener('click', async () => {
   const ctx = canvas.getContext('2d');
   ctx.drawImage(camVideo, 0, 0, canvas.width, canvas.height);
 
+  uploadResult.innerHTML = ''; // show only the method just used
   cameraResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
   autoWhiteBalance(canvas);
 
@@ -892,6 +893,7 @@ fileInput.addEventListener('change', async (e) => {
   canvas.height = img.naturalHeight;
   canvas.getContext('2d').drawImage(img, 0, 0);
 
+  cameraResult.innerHTML = ''; // show only the method just used
   uploadResult.innerHTML = '<p style="font-size:13px;color:#9aa0a6;">検出・識別中...</p>';
 
   let result = null;
