@@ -11,10 +11,38 @@
 // workers aren't supported, if this is already running locally via
 // server_coi.py (already isolated), or if registration fails for any
 // reason -- this is purely a speed optimization, never a requirement.
+//
+// SKIPPED ENTIRELY on iOS/iPadOS: the only thing cross-origin isolation
+// buys here is multi-threaded WASM (SharedArrayBuffer), and iOS is forced
+// to single-threaded WASM unconditionally elsewhere in this file (see
+// IS_IOS in the main module script) because of separate, unrelated
+// reload-memory issues. So on iOS this SW registration was paying for an
+// extra reload with zero benefit -- and was the direct cause of a
+// white-screen "loading -> reload -> loading -> reload" loop some users
+// hit: something about this SW's interaction with Safari's own fetch/
+// Cache handling on reload was landing the page back in a state where
+// crossOriginIsolated still read false, re-triggering the registration
+// attempt even with the sessionStorage guard below (the guard only
+// prevents *this script* from asking twice; it doesn't guarantee the SW
+// actually ends up controlling the page). Simplest fix: don't run any of
+// this on iOS, since it was never buying anything there anyway.
 (function () {
   if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
   if (window.crossOriginIsolated) return;
   if (window.self !== window.top) return; // don't mess with iframes/previews
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isIOS) {
+    // Also undo the damage for anyone who already hit this on a previous
+    // visit, before this fix existed: an already-installed, already-
+    // controlling SW from an earlier session isn't affected by simply
+    // skipping *future* registration attempts above, so explicitly
+    // unregister it here too.
+    navigator.serviceWorker.getRegistrations().then((regs) => {
+      regs.forEach((reg) => reg.unregister());
+    }).catch(() => {});
+    return;
+  }
   if (sessionStorage.getItem('coiReloadDone') === '1') return; // avoid reload loops
   navigator.serviceWorker.register('./coi-serviceworker.js').then(() => {
     sessionStorage.setItem('coiReloadDone', '1');
@@ -107,6 +135,18 @@ const fileInput = document.getElementById('fileInput');
 const uploadBox = document.getElementById('uploadBox');
 const uploadHint = document.getElementById('uploadHint');
 const detectionResult = document.getElementById('detectionResult');
+
+// Detects iOS/iPadOS Safari (incl. Chrome/Firefox on iOS, which are all
+// forced to use WebKit under the hood there -- there's no "real"
+// alternative engine on iOS). Declared this early because several consts
+// below (WASM thread count, WebGPU on/off, CLIP inference batch size) all
+// key off it, and need it available at their own declaration time.
+const IS_IOS = typeof navigator !== 'undefined' && (
+  /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  // iPadOS 13+ reports as "Macintosh" with touch support -- the standard
+  // way to distinguish it from a real Mac.
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+);
 
 function loadImage(src) {
   return new Promise((res, rej) => {
@@ -212,9 +252,18 @@ function pickIoNames(session) {
 // one scored top-list per crop, in the same order as dataUrls. Runs
 // entirely through raw onnxruntime-web (the fp16 'b' session, shared
 // window.ort instance with YOLO) -- see getClipFp16Session() above.
-async function classifyBatch(dataUrls) {
-  if (dataUrls.length === 0) return [];
+// Running all (up to 12) crops through CLIP as one batched tensor is
+// fast, but peak memory during that single forward pass scales with
+// batch size (intermediate activations, not just the weights) -- on iOS
+// that peak, stacked on top of the already-resident model weights, was
+// occasionally enough by itself to tip a device into an OOM crash even
+// with only one model loaded at a time (see releaseYoloSession() /
+// releaseClipSession() above). Running smaller chunks sequentially trades
+// a bit of speed for a much lower peak. Non-iOS keeps the original
+// single-batch behavior since it hasn't shown this problem.
+const CLIP_BATCH_CHUNK = IS_IOS ? 2 : 12;
 
+async function runClipChunk(dataUrls) {
   const ort = await getOrt();
   const { floatData, n, size } = await buildClipPixelData(dataUrls);
   const inputTensor = new ort.Tensor('float32', floatData, [n, 3, size, size]);
@@ -231,18 +280,43 @@ async function classifyBatch(dataUrls) {
     const norm = Math.sqrt(sumSq) || 1;
     for (let j = 0; j < dim; j++) flat[i * dim + j] = outTensor.data[i * dim + j] / norm;
   }
+  return { flat, n, dim };
+}
 
-  // Guard against silently-wrong results: if the live query vector's
-  // dimension doesn't match the database's, cosine() would otherwise just
-  // truncate/compare partial vectors and return meaningless scores that
-  // consistently favor one arbitrary label instead of erroring out.
-  if (dbEmbeddings.length && dim !== dbEmbeddings[0].vec.length) {
-    throw new Error(`埋め込みの次元数が一致しません(クエリ:${dim}次元, DB:${dbEmbeddings[0].vec.length}次元)。${EMBEDDINGS_FILE}を生成したモデルと表示中のモデルが違います。`);
+async function classifyBatch(dataUrls) {
+  if (dataUrls.length === 0) return [];
+
+  // Lazy first-use load (see init() above for why this moved out of
+  // startup). Cheap no-op on every call after the first, since
+  // getClipFp16Session() memoizes its promise.
+  if (!clipRawSession) {
+    statusBox.style.display = 'flex';
+    statusBox.querySelector('.spinner').style.display = 'inline-block';
+    document.getElementById('progressBarOuter').style.display = 'block';
+    statusText.textContent = 'MobileCLIP2モデル(B, fp16)を読み込み中(約87MB)...';
+    clipRawSession = await getClipFp16Session();
+    progressBarInner.style.width = '100%';
+    statusBox.style.display = 'none';
+    document.getElementById('progressBarOuter').style.display = 'none';
   }
+
   const results = [];
-  for (let i = 0; i < n; i++) {
-    const vec = Array.from(flat.slice(i * dim, (i + 1) * dim));
-    results.push(scoreVec(vec));
+  let dim = null;
+  for (let start = 0; start < dataUrls.length; start += CLIP_BATCH_CHUNK) {
+    const chunk = dataUrls.slice(start, start + CLIP_BATCH_CHUNK);
+    const { flat, n, dim: chunkDim } = await runClipChunk(chunk);
+    dim = chunkDim;
+    // Guard against silently-wrong results: if the live query vector's
+    // dimension doesn't match the database's, cosine() would otherwise
+    // just truncate/compare partial vectors and return meaningless scores
+    // that consistently favor one arbitrary label instead of erroring out.
+    if (dbEmbeddings.length && dim !== dbEmbeddings[0].vec.length) {
+      throw new Error(`埋め込みの次元数が一致しません(クエリ:${dim}次元, DB:${dbEmbeddings[0].vec.length}次元)。${EMBEDDINGS_FILE}を生成したモデルと表示中のモデルが違います。`);
+    }
+    for (let i = 0; i < n; i++) {
+      const vec = Array.from(flat.slice(i * dim, (i + 1) * dim));
+      results.push(scoreVec(vec));
+    }
   }
   return results;
 }
@@ -480,6 +554,21 @@ function getCv() {
 // especially for the ~165MB Hugging Face-hosted CLIP model). This caches
 // the raw bytes explicitly so a restart only needs a cache lookup.
 const MODEL_CACHE_NAME = 'onnx-model-cache-v1';
+// Only fetches+caches CLIP's bytes if they aren't already in Cache
+// Storage. See the call site in init() for why a naive unconditional
+// fetchModelBytes() call here was actively dangerous on a warm-cache page
+// reload -- this guard is the actual fix for that.
+async function warmClipCacheInBackground() {
+  try {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    const hit = await cache.match(CLIP_FP16_MODEL_FILE);
+    if (hit) return; // already cached -- nothing to warm
+    await fetchModelBytes(CLIP_FP16_MODEL_FILE);
+  } catch (err) {
+    console.warn('[clip-fp16] バックグラウンド先読みに失敗(初回識別時に再試行されます):', err);
+  }
+}
+
 async function fetchModelBytes(url) {
   try {
     const cache = await caches.open(MODEL_CACHE_NAME);
@@ -487,25 +576,10 @@ async function fetchModelBytes(url) {
     if (hit) return await hit.arrayBuffer();
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-    // Read the bytes ONCE, then build a fresh Response from that buffer for
-    // cache.put(). Previously this did res.clone() and ran cache.put()
-    // concurrently with res.arrayBuffer() -- two separate readers draining
-    // the same ~165MB stream at the same time, which briefly doubles peak
-    // memory right at the exact moment (download just finished, buffers
-    // about to be handed to WASM/WebGPU) that iOS Safari's tab-OOM-crash
-    // risk is highest. Caching after the read is sequential, not free, but
-    // avoids that concurrent-double-buffer spike.
-    const buf = await res.arrayBuffer();
-    // Awaited (not fire-and-forget): lets the Cache Storage write finish
-    // before the caller hands `buf` to InferenceSession.create(), so the
-    // cache write and the WASM/WebGPU buffer allocation -- two more
-    // large-memory operations on the same bytes -- don't overlap either.
-    try {
-      await cache.put(url, new Response(buf, { headers: res.headers }));
-    } catch (err) {
-      console.warn('[model-cache] put failed:', err);
-    }
-    return buf;
+    // Clone before consuming: one copy goes to cache.put, one is read here.
+    const toCache = res.clone();
+    cache.put(url, toCache).catch(err => console.warn('[model-cache] put failed:', err));
+    return await res.arrayBuffer();
   } catch (err) {
     console.warn('[model-cache] falling back to uncached fetch:', err);
     const res = await fetch(url);
@@ -525,11 +599,38 @@ let ortReadyPromise = null;
 // the MobileCLIP2 loader below both additionally retry at numThreads=1
 // (the original, always-safe behavior) if even that fails.
 const WASM_THREAD_CAP = 4;
+// iOS/iPadOS Safari (incl. Chrome/Firefox on iOS, which are all forced to
+// use WebKit under the hood -- there's no "real" alternative engine on
+// iOS) gets its own, more conservative path below: WebGPU on iOS is new
+// enough that large-model compute graphs can crash the GPU driver itself,
+// which is a native crash, not a JS exception -- none of the try/catch
+// fallback ladders in getYoloSession()/getClipFp16Session() can catch or
+// recover from that, so the safest fix is to never attempt it there in
+// the first place. Multi-threaded wasm is also capped harder on iOS since
+// its up-front SharedArrayBuffer reservation behavior has been less
+// consistent across iOS versions/devices than desktop -- and specifically
+// on page refresh: iOS doesn't always fully reclaim the previous page's
+// WASM linear memory before the new page's up-front SharedArrayBuffer
+// reservation runs, so a reload-then-reload-model sequence could crash
+// even when a cold first load of the same page was fine. Multi-threading
+// is now switched off entirely on iOS (single thread, no SharedArrayBuffer
+// reservation at all) rather than merely capped -- slower inference, but
+// removes this failure mode completely instead of just shrinking it.
+// (IS_IOS itself is declared near the top of this script, since
+// CLIP_BATCH_CHUNK below needs it before this point in file order.)
 function configureOrt(ort) {
+  if (IS_IOS) { ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false; return; }
   const isolated = typeof self !== 'undefined' && self.crossOriginIsolated;
   const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
   ort.env.wasm.numThreads = isolated ? Math.min(WASM_THREAD_CAP, Math.max(1, cores)) : 1;
   ort.env.wasm.proxy = false;
+}
+// WebGPU is skipped entirely on iOS (see IS_IOS comment above) -- wasm
+// only, everywhere on that platform, always.
+function pickProviders() {
+  if (IS_IOS) return ['wasm'];
+  const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
+  return hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
 }
 function getOrt() {
   if (!ortReadyPromise) {
@@ -557,8 +658,7 @@ function getYoloSession() {
       // Same ONNX weights in every branch below -- WebGPU/thread-count are
       // purely about *where*/*how parallel* the identical graph runs, so
       // none of this fallback ladder changes results, only speed.
-      const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
-      const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      const providers = pickProviders();
       const modelBytes = await fetchModelBytes('./icon_detector.onnx');
       try {
         return await ort.InferenceSession.create(modelBytes, { executionProviders: providers });
@@ -577,6 +677,22 @@ function getYoloSession() {
   return yoloSessionPromise;
 }
 
+// Frees YOLO's WASM buffers and forces the next getYoloSession() call to
+// recreate the session from scratch (bytes are still Cache Storage-cached,
+// so this only costs re-parsing into the WASM runtime, not a re-download).
+// Called right after detection finishes, before CLIP is loaded -- see
+// detectAndIdentify() below. Two ~90MB-class models (YOLO's own weights +
+// activations, and CLIP's) resident in WASM linear memory *at the same
+// time* was still enough to tip some devices into an OOM tab crash even
+// after every other fix here; this keeps only one heavy model resident at
+// any given moment, at the cost of a short re-init pause on the next photo.
+async function releaseYoloSession() {
+  if (!yoloSessionPromise) return;
+  const p = yoloSessionPromise;
+  yoloSessionPromise = null;
+  try { const session = await p; session.release(); } catch (_) {}
+}
+
 // Loads the self-hosted fp16 export of MobileCLIP2-B (see
 // convert_to_fp16.py) through the SAME onnxruntime-web instance as YOLO
 // above (window.ort), rather than transformers.js's separately-bundled
@@ -589,16 +705,7 @@ function getClipFp16Session() {
   if (!clipFp16SessionPromise) {
     clipFp16SessionPromise = (async () => {
       const ort = await getOrt();
-      // iOS (Safari/WebKit, including Chrome-on-iOS which is also WebKit
-      // under the hood) skips the WebGPU provider for this specific model.
-      // Real-device testing showed intermittent Safari tab crashes loading
-      // this ~165MB model; WebGPU would additionally need a GPU-side copy
-      // of the weights alongside the CPU ArrayBuffer already held for
-      // caching/WASM, and iOS Safari's WebGPU implementation is still new.
-      // WASM-only is slower but doesn't add that extra copy.
-      const isIOS = typeof navigator !== 'undefined' && /iP(hone|od|ad)/.test(navigator.userAgent || '');
-      const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
-      const providers = (hasWebGpu && !isIOS) ? ['webgpu', 'wasm'] : ['wasm'];
+      const providers = pickProviders();
       const modelBytes = await fetchModelBytes(CLIP_FP16_MODEL_FILE);
       try {
         return await ort.InferenceSession.create(modelBytes, { executionProviders: providers });
@@ -615,6 +722,18 @@ function getClipFp16Session() {
     })();
   }
   return clipFp16SessionPromise;
+}
+
+// Mirror of releaseYoloSession() above, for CLIP. Called right after
+// classification finishes -- see detectAndIdentify() below -- so that
+// between photos, neither heavy model is resident; only whichever one is
+// actively running has its buffers allocated.
+async function releaseClipSession() {
+  if (!clipFp16SessionPromise) return;
+  const p = clipFp16SessionPromise;
+  clipFp16SessionPromise = null;
+  clipRawSession = null;
+  try { const session = await p; session.release(); } catch (_) {}
 }
 
 const YOLO_INPUT_SIZE = 640;
@@ -871,9 +990,19 @@ async function detectAndIdentify(sourceCanvas) {
   const detected = await detectIconsYolo(sourceCanvas);
   if (!detected) return null;
 
+  // Free YOLO's buffers before CLIP even starts loading -- see
+  // releaseYoloSession() above. At this point all boxes/crops have
+  // already been extracted onto plain <canvas> elements, so YOLO's own
+  // session is no longer needed for the rest of this call.
+  await releaseYoloSession();
+
   const allBoxes = [...detected.own, ...detected.opp];
   const cropSrcs = allBoxes.map(box => cropBoxToDataUrlRaw(sourceCanvas, box));
   const tops = await classifyBatch(cropSrcs);
+
+  // Free CLIP's buffers now too, so between photos neither heavy model is
+  // resident -- only whichever one is actually running at a given moment.
+  await releaseClipSession();
 
   const own = [], opp = [];
   allBoxes.forEach((box, i) => {
@@ -1009,14 +1138,58 @@ uploadBox.addEventListener('click', () => {
   fileInput.click();
 });
 
+// Proactively frees onnxruntime-web's WASM linear memory (session.release())
+// when the page is being left, instead of waiting for the browser/OS to
+// reclaim it on its own timeline. iOS Safari in particular has been slow
+// to reclaim a tab's WASM memory after navigation, which was the direct
+// cause of "refresh, then load the model again, and it crashes" --
+// the new page's up-front memory reservation was landing before the old
+// page's had actually been freed. release() is synchronous and best-effort
+// (wrapped so a missing/failed release never blocks navigation).
+function releaseAllSessions() {
+  for (const p of [yoloSessionPromise, clipFp16SessionPromise]) {
+    if (!p) continue;
+    p.then(session => { try { session.release(); } catch (_) {} }).catch(() => {});
+  }
+}
+window.addEventListener('pagehide', releaseAllSessions);
+window.addEventListener('beforeunload', releaseAllSessions);
+
 async function init() {
   try {
     statusText.textContent = 'YOLOモデルを読み込み中...';
     await getYoloSession();
+    progressBarInner.style.width = '60%';
 
-    statusText.textContent = 'MobileCLIP2モデル(B, fp16)を読み込み中(約165MB)...';
-    clipRawSession = await getClipFp16Session();
-    progressBarInner.style.width = '100%';
+    // MobileCLIP2 (fp16, ~87MB) is deliberately NOT turned into a session
+    // here anymore. Loading both YOLO and CLIP up front, before the user
+    // had even uploaded a photo, meant both sets of WASM linear-memory
+    // buffers sat resident simultaneously from the moment the page
+    // opened -- on iOS Safari in particular this measurably raised the
+    // odds of an OOM tab crash (see IS_IOS / pickProviders() above).
+    // Session creation is deferred to first actual use, in classifyBatch()
+    // below. But the raw *bytes* are still worth warming into Cache
+    // Storage now, in the background, while the user is looking at
+    // detection results -- that's just a fetch+cache.put, no WASM buffers
+    // involved, so it doesn't reintroduce the crash risk, and it removes
+    // the network wait (the part that made identification feel slower)
+    // from the critical path of the first classification.
+    //
+    // CRITICAL: only actually fetch here if the bytes AREN'T already
+    // cached. On a page reload after a previous successful load, the
+    // Cache Storage entry already exists -- calling fetchModelBytes() in
+    // that state doesn't "warm" anything (there's nothing to warm), it
+    // just immediately materializes the full ~87MB ArrayBuffer out of
+    // Cache Storage for no reason. That read is fast (disk, not network),
+    // so it lands as a single large near-instant allocation instead of
+    // trickling in over a few seconds the way a real network fetch would
+    // -- and if the user then triggers actual classification before GC
+    // has reclaimed that unused prefetch buffer, classifyBatch's own
+    // fetchModelBytes()+InferenceSession.create() stacks a second ~87MB+
+    // allocation on top of it. That double-allocation, only possible on a
+    // warm-cache reload, was the direct cause of "works after clearing
+    // cache, crashes on reload."
+    warmClipCacheInBackground();
 
     // check order: IndexedDB cache (instant, no network) -> bundled
     // EMBEDDINGS_FILE. No in-browser computation fallback -- the file (from
