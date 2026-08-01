@@ -487,10 +487,25 @@ async function fetchModelBytes(url) {
     if (hit) return await hit.arrayBuffer();
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-    // Clone before consuming: one copy goes to cache.put, one is read here.
-    const toCache = res.clone();
-    cache.put(url, toCache).catch(err => console.warn('[model-cache] put failed:', err));
-    return await res.arrayBuffer();
+    // Read the bytes ONCE, then build a fresh Response from that buffer for
+    // cache.put(). Previously this did res.clone() and ran cache.put()
+    // concurrently with res.arrayBuffer() -- two separate readers draining
+    // the same ~165MB stream at the same time, which briefly doubles peak
+    // memory right at the exact moment (download just finished, buffers
+    // about to be handed to WASM/WebGPU) that iOS Safari's tab-OOM-crash
+    // risk is highest. Caching after the read is sequential, not free, but
+    // avoids that concurrent-double-buffer spike.
+    const buf = await res.arrayBuffer();
+    // Awaited (not fire-and-forget): lets the Cache Storage write finish
+    // before the caller hands `buf` to InferenceSession.create(), so the
+    // cache write and the WASM/WebGPU buffer allocation -- two more
+    // large-memory operations on the same bytes -- don't overlap either.
+    try {
+      await cache.put(url, new Response(buf, { headers: res.headers }));
+    } catch (err) {
+      console.warn('[model-cache] put failed:', err);
+    }
+    return buf;
   } catch (err) {
     console.warn('[model-cache] falling back to uncached fetch:', err);
     const res = await fetch(url);
@@ -574,8 +589,16 @@ function getClipFp16Session() {
   if (!clipFp16SessionPromise) {
     clipFp16SessionPromise = (async () => {
       const ort = await getOrt();
+      // iOS (Safari/WebKit, including Chrome-on-iOS which is also WebKit
+      // under the hood) skips the WebGPU provider for this specific model.
+      // Real-device testing showed intermittent Safari tab crashes loading
+      // this ~165MB model; WebGPU would additionally need a GPU-side copy
+      // of the weights alongside the CPU ArrayBuffer already held for
+      // caching/WASM, and iOS Safari's WebGPU implementation is still new.
+      // WASM-only is slower but doesn't add that extra copy.
+      const isIOS = typeof navigator !== 'undefined' && /iP(hone|od|ad)/.test(navigator.userAgent || '');
       const hasWebGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
-      const providers = hasWebGpu ? ['webgpu', 'wasm'] : ['wasm'];
+      const providers = (hasWebGpu && !isIOS) ? ['webgpu', 'wasm'] : ['wasm'];
       const modelBytes = await fetchModelBytes(CLIP_FP16_MODEL_FILE);
       try {
         return await ort.InferenceSession.create(modelBytes, { executionProviders: providers });
