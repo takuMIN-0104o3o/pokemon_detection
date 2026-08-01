@@ -990,19 +990,22 @@ async function detectAndIdentify(sourceCanvas) {
   const detected = await detectIconsYolo(sourceCanvas);
   if (!detected) return null;
 
-  // Free YOLO's buffers before CLIP even starts loading -- see
-  // releaseYoloSession() above. At this point all boxes/crops have
-  // already been extracted onto plain <canvas> elements, so YOLO's own
-  // session is no longer needed for the rest of this call.
-  await releaseYoloSession();
+  // NOTE: releaseYoloSession()/releaseClipSession() are intentionally NOT
+  // called here anymore. Releasing both models between every single photo
+  // kept peak memory low, but it meant every photo after the first paid
+  // the same "re-parse ~87MB into WASM linear memory" cost that used to
+  // only happen once per page load -- users on speed-sensitive workflows
+  // (identifying many photos in one sitting) felt that as a real
+  // regression. Per explicit user choice: sessions now stay resident for
+  // the whole page lifetime and are only released on actual navigation
+  // away (see releaseAllSessions() / pagehide+beforeunload above), not
+  // between photos. This does reintroduce some of the peak-memory risk
+  // those release calls were added to avoid -- if OOM crashes come back,
+  // that trade-off is the first thing to revisit.
 
   const allBoxes = [...detected.own, ...detected.opp];
   const cropSrcs = allBoxes.map(box => cropBoxToDataUrlRaw(sourceCanvas, box));
   const tops = await classifyBatch(cropSrcs);
-
-  // Free CLIP's buffers now too, so between photos neither heavy model is
-  // resident -- only whichever one is actually running at a given moment.
-  await releaseClipSession();
 
   const own = [], opp = [];
   allBoxes.forEach((box, i) => {
@@ -1159,37 +1162,28 @@ async function init() {
   try {
     statusText.textContent = 'YOLOモデルを読み込み中...';
     await getYoloSession();
-    progressBarInner.style.width = '60%';
+    progressBarInner.style.width = '50%';
 
-    // MobileCLIP2 (fp16, ~87MB) is deliberately NOT turned into a session
-    // here anymore. Loading both YOLO and CLIP up front, before the user
-    // had even uploaded a photo, meant both sets of WASM linear-memory
-    // buffers sat resident simultaneously from the moment the page
-    // opened -- on iOS Safari in particular this measurably raised the
-    // odds of an OOM tab crash (see IS_IOS / pickProviders() above).
-    // Session creation is deferred to first actual use, in classifyBatch()
-    // below. But the raw *bytes* are still worth warming into Cache
-    // Storage now, in the background, while the user is looking at
-    // detection results -- that's just a fetch+cache.put, no WASM buffers
-    // involved, so it doesn't reintroduce the crash risk, and it removes
-    // the network wait (the part that made identification feel slower)
-    // from the critical path of the first classification.
+    // Back to eager-loading both models up front. The earlier switch to
+    // lazy CLIP loading (+ background byte-prefetching, + releasing
+    // sessions between photos) was chasing what turned out to be the
+    // wrong culprit -- the real crash/reload-loop cause was the
+    // coi-serviceworker registration on iOS (see the guard at the very
+    // top of <head>), not two models being resident together. With that
+    // fixed, there's no more reason to pay a load-time delay on every
+    // single classification; load both once, up front, and keep them
+    // resident for the rest of the session.
     //
-    // CRITICAL: only actually fetch here if the bytes AREN'T already
-    // cached. On a page reload after a previous successful load, the
-    // Cache Storage entry already exists -- calling fetchModelBytes() in
-    // that state doesn't "warm" anything (there's nothing to warm), it
-    // just immediately materializes the full ~87MB ArrayBuffer out of
-    // Cache Storage for no reason. That read is fast (disk, not network),
-    // so it lands as a single large near-instant allocation instead of
-    // trickling in over a few seconds the way a real network fetch would
-    // -- and if the user then triggers actual classification before GC
-    // has reclaimed that unused prefetch buffer, classifyBatch's own
-    // fetchModelBytes()+InferenceSession.create() stacks a second ~87MB+
-    // allocation on top of it. That double-allocation, only possible on a
-    // warm-cache reload, was the direct cause of "works after clearing
-    // cache, crashes on reload."
-    warmClipCacheInBackground();
+    // Cache Storage (see fetchModelBytes()) already persists across page
+    // reloads on its own -- that's just normal browser storage, no extra
+    // wiring needed -- so a reload after the first successful load skips
+    // the network entirely and only re-parses the cached bytes into a
+    // fresh WASM session, which is the fastest a browser page can get
+    // without literally freezing a live WASM instance to disk (which
+    // isn't something pages are able to do).
+    statusText.textContent = 'MobileCLIP2モデル(B, fp16)を読み込み中(約87MB)...';
+    clipRawSession = await getClipFp16Session();
+    progressBarInner.style.width = '100%';
 
     // check order: IndexedDB cache (instant, no network) -> bundled
     // EMBEDDINGS_FILE. No in-browser computation fallback -- the file (from
